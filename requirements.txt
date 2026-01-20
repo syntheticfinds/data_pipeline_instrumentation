@@ -1,0 +1,13 @@
+# Core dependencies for EU AI Act compliance data pipeline instrumentation
+
+# PySpark for data processing and lineage tracking
+pyspark>=3.5.0
+
+# Pandas for data manipulation
+pandas>=2.0.0
+
+# OpenAI API for AI-powered compliance analysis
+openai>=1.0.0
+
+# Python environment variable management
+python-dotenv>=1.0.0
