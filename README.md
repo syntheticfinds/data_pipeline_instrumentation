@@ -20,16 +20,16 @@ Pipeline 2 → /tmp/lineage → Compliance Analysis → /tmp/all_lineage (enrich
 ## Pipeline Relationship
 
 ### Pipeline 1 (`pipeline1.py`)
-**Purpose**: Initial data processing
-**Input**: Creates sample user behavioral data (clicks, impressions, region, age)
-**Transformation**: Calculates Click-Through Rate (CTR) = clicks / impressions
-**Output**: `/tmp/pipeline1_output.csv`
+- **Purpose**: Initial data processing
+- **Input**: Creates sample user behavioral data (clicks, impressions, region, age)
+- **Transformation**: Calculates Click-Through Rate (CTR) = clicks / impressions
+- **Output**: `/tmp/pipeline1_output.csv`
 
 ### Pipeline 2 (`pipeline2.py`)
-**Purpose**: Secondary processing using Pipeline 1's output
-**Input**: Reads `/tmp/pipeline1_output.csv`
-**Transformation**: Segments users into value tiers based on CTR
-**Output**: `/tmp/pipeline2_output.csv`
+- **Purpose**: Secondary processing using Pipeline 1's output
+- **Input**: Reads `/tmp/pipeline1_output.csv`
+- **Transformation**: Segments users into value tiers based on CTR
+- **Output**: `/tmp/pipeline2_output.csv`
 
 **Key Relationship**: Pipeline 2 reads the output of Pipeline 1, demonstrating how lineage metadata flows across pipeline boundaries. When Pipeline 2 is analyzed, it inherits the origin and transformation metadata from Pipeline 1's data.
 
@@ -154,13 +154,13 @@ Enriched Records → /tmp/all_lineage/enriched_{timestamp}.jsonl
 ## Compliance Analysis Components
 
 ### `compliance_monitor.py`
-**Role**: Automatic trigger for compliance analysis
-**When**: Called by `lineage_spark` hooks after pipeline completion
-**What**: Checks if new lineage exists in `/tmp/lineage` and triggers analysis
+- **Role**: Automatic trigger for compliance analysis
+- **When**: Called by `lineage_spark` hooks after pipeline completion
+- **What**: Checks if new lineage exists in `/tmp/lineage` and triggers analysis
 
 ### `compliance_analyzer.py`
-**Role**: Interactive AI-powered compliance analysis
-**Process**:
+- **Role**: Interactive AI-powered compliance analysis
+- **Process**:
 1. Loads lineage from `/tmp/lineage`
 2. Presents data to GPT-4 for EU AI Act requirements analysis
 3. Asks human clarifying questions
