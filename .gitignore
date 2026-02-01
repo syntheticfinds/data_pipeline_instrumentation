@@ -1,1 +1,4 @@
 .pw_google_profile/
+__pycache__/
+*.pyc
+*.pyo
