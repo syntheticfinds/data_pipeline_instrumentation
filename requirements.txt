@@ -11,3 +11,17 @@ openai>=1.0.0
 
 # Python environment variable management
 python-dotenv>=1.0.0
+
+pydantic
+
+google-api-python-client
+
+google-auth
+
+google-auth-oauthlib
+
+playwright
+
+torch>=2.0.0
+opacus>=1.4.0
+anthropic>=0.40.0

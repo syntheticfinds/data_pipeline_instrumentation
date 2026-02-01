@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "AI Doc Reviewer (MVP)",
+  "version": "0.1.0",
+  "description": "Generate EU AI Act / governance review comments for selected text in Google Docs.",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": [
+    "https://docs.google.com/*",
+    "http://localhost:8000/*"
+  ],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["https://docs.google.com/document/*"],
+      "js": ["content.js"]
+    }
+  ]
+}

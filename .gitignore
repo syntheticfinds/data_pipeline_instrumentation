@@ -3,3 +3,18 @@ __pycache__/
 *.pyc
 *.pyo
 env/
+# ---- Training artifacts ----
+model_training/checkpoints/
+*.pt
+*.pth
+
+# ---- Governance artifacts ----
+model_training/governance_out/
+**/events.jsonl
+**/governance_context_bundle.json
+
+# ---- Review agent outputs ----
+model_training/review_out/
+**/privacy_review.md
+**/proposed_fixes.diff
+**/*.updated
