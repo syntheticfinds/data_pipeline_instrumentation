@@ -420,12 +420,11 @@ def main():
         print("No code changes proposed; no diff written.")
 
     print("\nVS Code-first workflow:")
-    print("1) git checkout -b privacy-fixes/<run_id>")
     if diffs:
-        print(f"2) git apply {proposed_diff_path}")
-        print("3) Open Source Control in VS Code to accept/reject hunks.")
+        print(f"1) git apply {proposed_diff_path}")
+        print("2) Open Source Control in VS Code to accept/reject hunks.")
     else:
-        print("2) No patch generated (no code changes).")
+        print("1) No patch generated (no code changes).")
 
 
 if __name__ == "__main__":
