@@ -18,3 +18,7 @@ model_training/review_out/
 **/privacy_review.md
 **/proposed_fixes.diff
 **/*.updated
+
+# Never commit secrets
+.env
+**/.env
