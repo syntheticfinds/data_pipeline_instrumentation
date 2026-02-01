@@ -210,7 +210,7 @@ def train():
             print(f"epoch={epoch+1}/{epochs} loss={avg_loss:.4f} acc={acc:.3f}")
 
     # ✅ Save checkpoint (privacy_torch patches torch.save and logs checksum/permissions)
-    os.makedirs("./checkpoints", mode=0o700, exist_ok=True)
+    os.makedirs("./checkpoints", exist_ok=True)
     ckpt_path = "./checkpoints/toy_classifier_dp.pt"
 
     torch.save(
@@ -224,7 +224,12 @@ def train():
         },
         ckpt_path,
     )
-    # Restrict checkpoint file permissions for healthcare data protection
+    
+    # PRIVACY FIX: Restrict checkpoint file permissions to owner-only (0o600).
+    # Healthcare models trained on clinical notes require strict access controls.
+    # GDPR Art. 5(1)(f) - integrity and confidentiality principle.
+    # GDPR Art. 32 - security of processing requires appropriate technical measures.
+    # HIPAA: Also aligns with technical safeguards for PHI-derived artifacts.
     os.chmod(ckpt_path, 0o600)
     print(f"Saved checkpoint: {ckpt_path}")
 

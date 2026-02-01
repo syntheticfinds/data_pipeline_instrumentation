@@ -6,11 +6,12 @@ import json
 import os
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Tuple
+from dotenv import load_dotenv
+from typing import Dict, List
 
 from privacy_review_agent.artifact_loader import load_bundle, load_events
 
+load_dotenv()
 
 # ----------------------------
 # Prompt builders
@@ -28,7 +29,20 @@ CRITICAL RULES:
 - Do NOT propose or modify instrumentation code or any non-editable files.
 - Make minimal, safe changes focused on training-time privacy risks.
 
-You MUST use the text editor tool to edit the training file(s).
+REGULATORY ANCHOR:
+- Anchor your reasoning primarily to GDPR.
+- Prefer citing GDPR principles and specific articles when relevant:
+  - Art. 5(1)(f) integrity and confidentiality
+  - Art. 25 data protection by design and by default
+  - Art. 32 security of processing (technical/organizational measures)
+- If the domain indicates healthcare, you MAY additionally mention HIPAA concepts,
+  but GDPR should remain the main anchor.
+
+REQUIRED OUTPUT BEHAVIOR:
+- You MUST use the text editor tool to edit the training file(s).
+- For every fix you make, you MUST add an inline code comment near the change that explains:
+  (a) what privacy risk it mitigates and
+  (b) what GDPR principle/article it maps to.
 
 After edits, output:
 1) A short evidence-based review in markdown
@@ -55,7 +69,10 @@ ARTIFACTS: events.jsonl (parsed)
 TASK:
 1) Identify privacy/regulatory issues grounded in the artifacts and intended use.
 2) Apply fixes ONLY to EDITABLE_FILES using the text editor tool.
-3) Keep fixes minimal and safe.
+3) IMPORTANT: For every code change, add an inline comment that:
+   - explains the privacy/security reason, AND
+   - explicitly references GDPR (e.g., Art. 5(1)(f), Art. 25, Art. 32).
+4) Keep fixes minimal and safe.
 """
 
 
@@ -277,6 +294,8 @@ def run_claude_text_editor(
             "content": (
                 "Use the text_editor tool to update ONLY the files listed in EDITABLE_FILES. "
                 "First open each file, then apply minimal fixes using replace operations. "
+                "CRITICAL: For every change you make in code, add an inline comment explaining the reason "
+                "and referencing GDPR (Art. 5(1)(f), Art. 25, Art. 32). "
                 "When finished, respond with markdown review summary and bullet list of changes."
             ),
         },
@@ -365,7 +384,7 @@ def main():
     system_prompt = build_system_prompt()
     user_prompt = build_user_prompt(bundle, events, editable_rel_paths)
 
-    model = os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
+    model = os.getenv("CLAUDE_MODEL", "claude-opus-4-5-20251101")
     max_tokens = int(os.getenv("CLAUDE_MAX_TOKENS", "3000"))
     temperature = float(os.getenv("CLAUDE_TEMPERATURE", "0"))
 
