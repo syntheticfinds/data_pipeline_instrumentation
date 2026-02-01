@@ -101,7 +101,7 @@ def step3_analyze_compliance(materialized_rows, pipeline_name=""):
         print("\nSkipping analysis step.")
         return None
 
-    from etl_ops.compliance_analyzer import ComplianceAnalyzer
+    from compliance_analyzer import ComplianceAnalyzer
 
     analyzer = ComplianceAnalyzer(api_key=api_key)
 

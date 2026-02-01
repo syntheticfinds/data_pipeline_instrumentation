@@ -43,7 +43,7 @@ class ComplianceMonitor:
         """Execute the compliance analysis"""
         try:
             # Import here to avoid circular dependencies
-            from etl_ops.compliance_analysis_end_to_end import step2_extract_data, step3_analyze_compliance
+            from compliance_analysis_end_to_end import step2_extract_data, step3_analyze_compliance
 
             # Extract data
             materialized_rows = step2_extract_data()
