@@ -1,8 +1,7 @@
 // =========================
-// Phase 1 MVP: Privacy mode
+// Privacy Review Extension
 // - Copy-first clipboard read (best effort)
 // - Fallback modal paste box (reliable)
-// - Optional "Set Context" per-doc (stored in chrome.storage.local)
 // - Backend payload includes: mode, doc_title, doc_text, selection
 // - Posts ONE anchored comment thread per selection (manual Cmd+Option+M to open box)
 // =========================
@@ -22,21 +21,6 @@ function getDocTitleBestEffort() {
   // Usually: "<Title> - Google Docs"
   const raw = document.title || "";
   return raw.replace(" - Google Docs", "").trim();
-}
-
-function storageKeyForContext(docId) {
-  return `ai_review_context::${docId || "unknown_doc"}`;
-}
-
-async function saveContextForDoc(docId, text) {
-  const key = storageKeyForContext(docId);
-  await chrome.storage.local.set({ [key]: text });
-}
-
-async function loadContextForDoc(docId) {
-  const key = storageKeyForContext(docId);
-  const data = await chrome.storage.local.get([key]);
-  return data[key] || "";
 }
 
 // ---------- modal paste UI (clipboard fallback) ----------
@@ -244,81 +228,6 @@ const BACKEND_URL = "http://localhost:8000"; // change when deployed
 const MCP_HTTP_URL = "http://localhost:3001"; // MCP server Express endpoint
 const API_KEY = "dev_secret_key_change_me"; // move to chrome.storage later
 
-async function callBackendReview({ selection, mode, docTitle, docText, googleDocId }) {
-  console.log("Calling backend review POST...");
-  const res = await fetch(`${BACKEND_URL}/review`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-API-Key": API_KEY,
-    },
-    body: JSON.stringify({
-      selection,
-      mode,
-      doc_title: docTitle,
-      doc_text: docText,
-      google_doc_id: googleDocId,
-    }),
-  });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(err);
-  }
-
-  return await res.json();
-}
-
-async function callOrchestrateModifications({
-  docText,
-  docTitle,
-  googleDocId,
-  reviewComments,
-  parsedComponents,
-  parsedDataFlows,
-}) {
-  console.log("Calling backend orchestrate-modifications POST (Sanity Agent Actions)...");
-  console.log("Using pre-parsed structure:", parsedComponents ? "yes" : "no");
-  const res = await fetch(`${BACKEND_URL}/orchestrate-modifications`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-API-Key": API_KEY,
-    },
-    body: JSON.stringify({
-      doc_text: docText,
-      doc_title: docTitle,
-      google_doc_id: googleDocId,
-      review_comments: reviewComments,
-      parsed_components: parsedComponents || null,
-      parsed_data_flows: parsedDataFlows || null,
-    }),
-  });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(err);
-  }
-
-  return await res.json();
-}
-
-async function callMcpApplySuggestions({ docId, suggestions }) {
-  console.log("Calling MCP server apply-suggestions POST...");
-  const res = await fetch(`${MCP_HTTP_URL}/apply-suggestions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ docId, suggestions }),
-  });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(err);
-  }
-
-  return await res.json();
-}
-
 async function callMcpGetDoc({ docId }) {
   console.log("Calling MCP server get-doc GET...");
   const res = await fetch(`${MCP_HTTP_URL}/get-doc/${docId}`, {
@@ -333,16 +242,122 @@ async function callMcpGetDoc({ docId }) {
   return await res.json();
 }
 
+async function callGenerateModifications({
+  reviewComments,
+  parsedComponents,
+  parsedDataFlows,
+  sessionId,
+}) {
+  console.log("Calling backend generate-modifications POST...");
+  const res = await fetch(`${BACKEND_URL}/generate-modifications`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-API-Key": API_KEY,
+    },
+    body: JSON.stringify({
+      review_comments: reviewComments,
+      parsed_components: parsedComponents,
+      parsed_data_flows: parsedDataFlows,
+      session_id: sessionId,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(err);
+  }
+
+  return await res.json();
+}
+
 // ---------- comment posting ----------
+
+/**
+ * Group comments that have identical text (after stripping component prefix).
+ * Returns array of { comment, severity, components, dataFlows }.
+ */
+function groupSimilarComments(comments) {
+  const groups = new Map();
+
+  for (const c of comments) {
+    // Extract component prefix if present: "[Component Name]: rest of comment"
+    const match = c.comment?.match(/^\[([^\]]+)\]:\s*/);
+    const componentFromPrefix = match ? match[1] : null;
+    const commentWithoutPrefix = match ? c.comment.slice(match[0].length) : c.comment;
+
+    // Collect all components/flows for this comment
+    const allItems = new Set(c.related_components || []);
+    if (componentFromPrefix) {
+      allItems.add(componentFromPrefix);
+    }
+
+    // Separate components from data flows (data flows contain "→" or "->")
+    const components = new Set();
+    const dataFlows = new Set();
+    for (const item of allItems) {
+      if (item.includes("→") || item.includes("->")) {
+        dataFlows.add(item);
+      } else {
+        components.add(item);
+      }
+    }
+
+    // Use the comment text (without prefix) as the grouping key
+    const key = `${c.severity}:${commentWithoutPrefix}`;
+
+    if (groups.has(key)) {
+      const existing = groups.get(key);
+      // Merge components and data flows
+      for (const comp of components) {
+        existing.components.add(comp);
+      }
+      for (const flow of dataFlows) {
+        existing.dataFlows.add(flow);
+      }
+    } else {
+      groups.set(key, {
+        comment: commentWithoutPrefix,
+        severity: c.severity || "medium",
+        components: components,
+        dataFlows: dataFlows,
+      });
+    }
+  }
+
+  // Convert to array and sort by severity
+  const severityOrder = { high: 0, medium: 1, low: 2 };
+  return Array.from(groups.values())
+    .sort((a, b) => (severityOrder[a.severity] || 1) - (severityOrder[b.severity] || 1));
+}
+
 async function postSingleAnchoredCommentPrivacy(inlineComments) {
   if (!inlineComments || inlineComments.length === 0) return 0;
+
+  // Group similar comments together
+  const grouped = groupSimilarComments(inlineComments.slice(0, 8));
 
   let body = "🤖 AI Privacy Review\n";
   body += "----------------------------------\n";
 
-  inlineComments.slice(0, 8).forEach((c, i) => {
-    body += `\n${i + 1}) [PRIVACY | ${String(c.severity || "medium").toUpperCase()}]\n`;
-    body += `${c.comment}\n`;
+  grouped.forEach((g, i) => {
+    const severity = String(g.severity).toUpperCase();
+
+    // Build affected items line with clear labels
+    let affectedItems = "";
+    if (g.components.size > 0) {
+      affectedItems += `🔧 ${Array.from(g.components).join(", ")}`;
+    }
+    if (g.dataFlows.size > 0) {
+      if (affectedItems) affectedItems += "\n     ";
+      affectedItems += `🔀 ${Array.from(g.dataFlows).join(", ")}`;
+    }
+
+    body += `\n${i + 1}) [${severity}]`;
+    if (affectedItems) {
+      body += `\n     ${affectedItems}`;
+    }
+    body += `\n${g.comment}\n`;
   });
 
   await focusDoc();
@@ -606,35 +621,33 @@ function showCurrentModification() {
   progress.appendChild(severityBadge);
   content.appendChild(progress);
 
-  // Target Section
-  const sectionBox = document.createElement("div");
-  sectionBox.style.marginBottom = "12px";
-  sectionBox.style.padding = "10px";
-  sectionBox.style.background = "#1a1a2e";
-  sectionBox.style.borderRadius = "8px";
-  sectionBox.style.borderLeft = "3px solid #58a6ff";
+  // Target Component/Data Flow
+  const targetBox = document.createElement("div");
+  targetBox.style.marginBottom = "12px";
+  targetBox.style.padding = "10px";
+  targetBox.style.background = "#1a1a2e";
+  targetBox.style.borderRadius = "8px";
+  targetBox.style.borderLeft = "3px solid #58a6ff";
 
-  const sectionLabel = document.createElement("div");
-  sectionLabel.textContent = "📍 Target Section";
-  sectionLabel.style.fontSize = "10px";
-  sectionLabel.style.color = "#8b949e";
-  sectionLabel.style.marginBottom = "4px";
-  sectionLabel.style.textTransform = "uppercase";
-  sectionLabel.style.letterSpacing = "0.5px";
+  const targetLabel = document.createElement("div");
+  const isDataFlow = mod.target?.target_type === "data_flow";
+  targetLabel.textContent = isDataFlow ? "🔀 Data Flow" : "🔧 Component";
+  targetLabel.style.fontSize = "10px";
+  targetLabel.style.color = "#8b949e";
+  targetLabel.style.marginBottom = "4px";
+  targetLabel.style.textTransform = "uppercase";
+  targetLabel.style.letterSpacing = "0.5px";
 
-  const sectionTitle = document.createElement("div");
-  sectionTitle.textContent = mod.target_section.title;
-  sectionTitle.style.fontWeight = "600";
-  sectionTitle.style.color = mod.target_section.is_new ? "#a371f7" : "#fff";
-  if (mod.target_section.is_new) {
-    sectionTitle.textContent += " (NEW)";
-  }
+  const targetName = document.createElement("div");
+  targetName.textContent = mod.target?.name || "Unknown";
+  targetName.style.fontWeight = "600";
+  targetName.style.color = isDataFlow ? "#a371f7" : "#fff";
 
-  sectionBox.appendChild(sectionLabel);
-  sectionBox.appendChild(sectionTitle);
-  content.appendChild(sectionBox);
+  targetBox.appendChild(targetLabel);
+  targetBox.appendChild(targetName);
+  content.appendChild(targetBox);
 
-  // Modification Text
+  // Modification Description
   const modBox = document.createElement("div");
   modBox.style.marginBottom = "12px";
   modBox.style.padding = "10px";
@@ -643,13 +656,14 @@ function showCurrentModification() {
   modBox.style.borderLeft = "3px solid #3fb950";
 
   const modLabel = document.createElement("div");
-  modLabel.textContent = "✏️ Add This Text";
+  modLabel.textContent = "✏️ Required Changes";
   modLabel.style.fontSize = "10px";
   modLabel.style.color = "#8b949e";
   modLabel.style.marginBottom = "6px";
   modLabel.style.textTransform = "uppercase";
   modLabel.style.letterSpacing = "0.5px";
 
+  const modificationText = mod.modification || "";
   const modText = document.createElement("div");
   modText.style.fontSize = "11px";
   modText.style.lineHeight = "1.5";
@@ -658,9 +672,9 @@ function showCurrentModification() {
   modText.style.maxHeight = "120px";
   modText.style.overflowY = "auto";
   // Show first 500 chars with ellipsis
-  const displayText = mod.modification_text.length > 500
-    ? mod.modification_text.substring(0, 500) + "..."
-    : mod.modification_text;
+  const displayText = modificationText.length > 500
+    ? modificationText.substring(0, 500) + "..."
+    : modificationText;
   modText.textContent = displayText;
 
   // Copy button
@@ -676,7 +690,7 @@ function showCurrentModification() {
   copyBtn.style.cursor = "pointer";
   copyBtn.onclick = async () => {
     try {
-      await navigator.clipboard.writeText(mod.modification_text);
+      await navigator.clipboard.writeText(modificationText);
       copyBtn.textContent = "✓ Copied!";
       copyBtn.style.background = "#3fb950";
       copyBtn.style.color = "#000";
@@ -846,41 +860,6 @@ async function callBackendReviewWithStatus({ selection, mode, docTitle, docText,
   return await res.json();
 }
 
-async function callOrchestrateModificationsWithStatus({
-  docText,
-  docTitle,
-  googleDocId,
-  reviewComments,
-  parsedComponents,
-  parsedDataFlows,
-  sessionId,
-}) {
-  console.log("Calling backend orchestrate-modifications POST with session:", sessionId);
-  const res = await fetch(`${BACKEND_URL}/orchestrate-modifications`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-API-Key": API_KEY,
-    },
-    body: JSON.stringify({
-      doc_text: docText,
-      doc_title: docTitle,
-      google_doc_id: googleDocId,
-      review_comments: reviewComments,
-      parsed_components: parsedComponents || null,
-      parsed_data_flows: parsedDataFlows || null,
-      session_id: sessionId,
-    }),
-  });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(err);
-  }
-
-  return await res.json();
-}
-
 // ---------- UI injection ----------
 function injectFloatingButtons() {
   if (document.getElementById("ai-review-wrap")) return;
@@ -904,49 +883,13 @@ function injectFloatingButtons() {
     btn.style.fontSize = "13px";
   };
 
-  // Button 1: Set context (copy-first + fallback paste box)
-  const setCtxBtn = document.createElement("button");
-  setCtxBtn.id = "ai-set-context-btn";
-  setCtxBtn.textContent = "📌 Set AI Context";
-  baseBtnStyle(setCtxBtn);
-
-  setCtxBtn.onclick = async () => {
-    try {
-      setCtxBtn.textContent = "Saving...";
-
-      const docId = getDocIdFromUrl();
-
-      let ctxText = (await getSelectedTextViaClipboard()).trim();
-      if (ctxText.length < 80) {
-        ctxText = await showPasteBox({
-          title: "📌 Set AI Context",
-          placeholder:
-            "Paste a doc overview / system context section here (>= ~80 chars).",
-        });
-      }
-
-      if (!ctxText || ctxText.length < 80) {
-        alert("Context too short. Paste a larger doc overview section.");
-        setCtxBtn.textContent = "📌 Set AI Context";
-        return;
-      }
-
-      await saveContextForDoc(docId, ctxText);
-      alert("✅ Saved doc context for this document.");
-    } catch (e) {
-      alert("Error saving context: " + e);
-    } finally {
-      setCtxBtn.textContent = "📌 Set AI Context";
-    }
-  };
-
-  // Button 2: Review selection (privacy mode) (copy-first + fallback paste box)
+  // Privacy Review button (copy-first + fallback paste box)
   const reviewBtn = document.createElement("button");
   reviewBtn.id = "ai-review-btn";
   reviewBtn.textContent = "🤖 Privacy Review";
   baseBtnStyle(reviewBtn);
 
-  // Button 3: Apply Suggestions (hidden until a review is run)
+  // Apply Suggestions button (hidden until a review is run)
   const applyBtn = document.createElement("button");
   applyBtn.id = "ai-apply-btn";
   applyBtn.textContent = "✏️ Apply Suggestions";
@@ -1049,101 +992,74 @@ function injectFloatingButtons() {
       return;
     }
 
-    const docId = getDocIdFromUrl();
-    if (!docId) {
-      alert("Could not detect Google Doc ID from URL.");
+    // Check we have parsed components or data flows
+    if (!lastParsedComponents && !lastParsedDataFlows) {
+      alert("No components or data flows found from the review. Run a Privacy Review on a document with technical components.");
       return;
     }
-
-    const docTitle = getDocTitleBestEffort();
 
     // Show status panel and connect to stream
     const sessionId = generateSessionId();
     showStatusPanel();
     connectStatusStream(sessionId);
-    addStatusEntry({ type: "step", message: "Starting apply-suggestions flow..." });
+    addStatusEntry({ type: "step", message: "Generating modification suggestions..." });
 
     try {
-      applyBtn.textContent = "Fetching doc...";
-      addStatusEntry({ type: "info", message: "Fetching full document content..." });
+      applyBtn.textContent = "Analyzing...";
 
-      // Fetch full document content via MCP server
-      let fullDocText = "";
-      let fetchedTitle = docTitle;
-      try {
-        const docData = await callMcpGetDoc({ docId });
-        fullDocText = docData.content || "";
-        fetchedTitle = docData.title || docTitle;
-        console.log(`Fetched full document: ${docData.contentLength} chars`);
-        addStatusEntry({ type: "info", message: `Fetched ${docData.contentLength} characters` });
-      } catch (mcpErr) {
-        console.warn("Failed to fetch full doc via MCP, falling back to selection:", mcpErr);
-        addStatusEntry({ type: "warning", message: "Could not fetch full doc, using selection" });
-        // Fallback: use stored context + selection
-        const storedContext = await loadContextForDoc(docId);
-        fullDocText = storedContext
-          ? `${storedContext}\n\n---\n\n${lastReviewSelection}`
-          : lastReviewSelection;
-      }
-
-      applyBtn.textContent = "Processing...";
-      addStatusEntry({ type: "step", message: "Sending to orchestrator..." });
-
-      // Step 1: Call orchestrator to create Sanity graph + run Agent Actions
+      // Format comments for the endpoint (include related_components for filtering)
       const commentsPayload = lastReviewComments.map((c) => ({
         target_quote: c.target_quote,
         comment: c.comment,
         severity: c.severity || "medium",
+        related_components: c.related_components || [],
       }));
 
-      console.log("Calling orchestrate-modifications with Sanity Agent Actions...");
-      const orchestratorResult = await callOrchestrateModificationsWithStatus({
-        docText: fullDocText,
-        docTitle: fetchedTitle,
-        googleDocId: docId,
+      addStatusEntry({
+        type: "info",
+        message: `Analyzing ${commentsPayload.length} compliance issues against ${(lastParsedComponents || []).length} components`
+      });
+
+      console.log("Calling generate-modifications...");
+      console.log("  - Comments:", commentsPayload.length);
+      console.log("  - Components:", (lastParsedComponents || []).length);
+      console.log("  - Data flows:", (lastParsedDataFlows || []).length);
+
+      const result = await callGenerateModifications({
         reviewComments: commentsPayload,
-        parsedComponents: lastParsedComponents,
-        parsedDataFlows: lastParsedDataFlows,
+        parsedComponents: lastParsedComponents || [],
+        parsedDataFlows: lastParsedDataFlows || [],
         sessionId,
       });
 
-      if (orchestratorResult.error) {
-        addStatusEntry({ type: "error", message: `Orchestrator error: ${orchestratorResult.error}` });
+      if (result.error) {
+        addStatusEntry({ type: "error", message: `Error: ${result.error}` });
         setTimeout(() => hideStatusPanel(), 3000);
-        alert("Orchestrator error: " + orchestratorResult.error);
+        alert("Error generating modifications: " + result.error);
         applyBtn.textContent = "✏️ Apply Suggestions";
         return;
       }
 
-      console.log("Orchestrator result:", orchestratorResult);
-      console.log("  - Design doc ID:", orchestratorResult.design_doc_id);
-      console.log("  - Issues created:", orchestratorResult.issue_ids?.length);
-      console.log("  - Agent actions:", orchestratorResult.action_results?.length);
-      console.log("  - Guided modifications:", orchestratorResult.guided_modifications?.length);
+      console.log("Modification result:", result);
+      console.log("  - Modifications:", result.modifications?.length);
 
-      addStatusEntry({
-        type: "success",
-        message: `Created ${orchestratorResult.issue_ids?.length || 0} compliance issues`
-      });
-
-      const modifications = orchestratorResult.guided_modifications || [];
-      console.log("Guided modifications from orchestrator:", modifications);
+      const modifications = result.modifications || [];
+      console.log("Modifications from generator:", modifications);
       console.log("Number of modifications:", modifications.length);
 
       if (modifications.length === 0) {
-        addStatusEntry({ type: "complete", message: "No modifications generated" });
+        addStatusEntry({ type: "complete", message: "No modifications needed" });
         setTimeout(() => hideStatusPanel(), 2000);
         alert(
-          `✅ Sanity document graph created (${orchestratorResult.design_doc_id}).\n\n` +
-          `Created ${orchestratorResult.issue_ids?.length || 0} compliance issues.\n` +
-          `Executed ${orchestratorResult.action_results?.length || 0} Agent Actions.\n\n` +
-          `No modifications were generated. The document may already be compliant.`
+          `✅ Analysis complete.\n\n` +
+          `No specific modifications were generated. ` +
+          `The document may already address the compliance issues, or the issues may require manual review.`
         );
         applyBtn.textContent = "✏️ Apply Suggestions";
         return;
       }
 
-      addStatusEntry({ type: "step", message: `Generated ${modifications.length} modifications to review` });
+      addStatusEntry({ type: "success", message: `Generated ${modifications.length} modifications` });
 
       // Show guided modifications in the status panel
       showGuidedModifications(modifications, () => {
@@ -1161,7 +1077,7 @@ function injectFloatingButtons() {
           hideStatusPanel();
           alert(
             `✅ Reviewed ${modifications.length} modification(s).\n\n` +
-            `Copy each modification and paste it into the appropriate section of your Google Doc.`
+            `Update the relevant components/data flows in your design document based on these suggestions.`
           );
         }, 1500);
       });
@@ -1176,7 +1092,6 @@ function injectFloatingButtons() {
     }
   };
 
-  wrap.appendChild(setCtxBtn);
   wrap.appendChild(reviewBtn);
   wrap.appendChild(applyBtn);
   document.body.appendChild(wrap);

@@ -7,6 +7,10 @@ class InlineComment(BaseModel):
     target_quote: str = Field(..., description="Exact substring from input text.")
     severity: Severity
     comment: str
+    related_components: List[str] = Field(
+        default_factory=list,
+        description="Names of components or data flows this comment applies to"
+    )
 
 class ReviewResponse(BaseModel):
     inline_comments: List[InlineComment]

@@ -17,9 +17,10 @@ ReviewMode = Literal["general", "privacy"]
 SYSTEM_PRIVACY = """You are a HIPAA compliance reviewer for AI systems. You write precise, consequence-aware review comments.
 
 COMMENT FORMAT - Every comment MUST follow this structure:
-"Since you're doing [X], you should be aware of [regulation Y] which [description]. Violations can result in [fine range]. [Action to take]."
+"[Component/Data Flow Name]: Since you're doing [X], you should be aware of [regulation Y] which [description]. Violations can result in [fine range]. [Action to take]."
 
 Where:
+- Component/Data Flow Name = The specific technical component or data flow this applies to
 - X = What the system is doing (from the selected text)
 - Y = The specific HIPAA regulation section (e.g., § 164.312)
 - Description = What the regulation requires (in plain language)
@@ -27,19 +28,21 @@ Where:
 - Action = Specific technical action to comply
 
 CRITICAL RULES:
-1. Describe what the regulation REQUIRES, not specific enforcement cases.
-2. Mention the potential fine RANGE (e.g., "up to $50K per violation" or "fines ranging from $100 to $50K").
-3. Be specific about what the system is doing that triggers each regulation.
-4. Recommend specific technical actions from the research.
+1. ALWAYS start with the component or data flow name in brackets, e.g., "[Patient Portal]:" or "[API → Database]:"
+2. Describe what the regulation REQUIRES, not specific enforcement cases.
+3. Mention the potential fine RANGE (e.g., "up to $50K per violation" or "fines ranging from $100 to $50K").
+4. Be specific about what the system is doing that triggers each regulation.
+5. Recommend specific technical actions from the research.
 
 OUTPUT QUALITY RULES:
-5. Every comment MUST be a complete, self-contained thought. Never leave a sentence or point unfinished.
-6. Keep comments concise (2-4 sentences). Finish every sentence.
-7. Write in plain, professional language as if advising a colleague.
+6. Every comment MUST be a complete, self-contained thought. Never leave a sentence or point unfinished.
+7. Keep comments concise (2-4 sentences). Finish every sentence.
+8. Write in plain, professional language as if advising a colleague.
 
 You must:
 - Anchor every comment to an EXACT substring from the Selected Text.
-- Follow the "Since you're doing X... regulation Y which [requires]... fines up to [amount]... Do [action]" format.
+- START every comment with the affected component/data flow in brackets.
+- Follow the "[Component]: Since you're doing X... regulation Y which [requires]... fines up to [amount]... Do [action]" format.
 - Do NOT include specific company names or enforcement case anecdotes.
 - Output JSON only.
 """
@@ -68,31 +71,37 @@ INSTRUCTIONS
 You have FULL CONTEXT of the document architecture above. Use this to understand where the selected text fits in the overall system design.
 
 For each comment, you MUST follow this format:
-"Since you're doing [X], you should be aware of [regulation Y] which [description]. Violations can result in [fine range]. [Action to take]."
+"[Component/Data Flow]: Since you're doing [X], you should be aware of [regulation Y] which [description]. Violations can result in [fine range]. [Action to take]."
 
 REQUIRED ELEMENTS IN EACH COMMENT:
 
-1. WHAT THEY'RE DOING (X)
+1. COMPONENT/DATA FLOW (in brackets at the start)
+   - Identify which component or data flow from the architecture this applies to
+   - Use the exact name from the document structure
+   - For data flows, use format: "[Source → Target]:"
+   - Example: "[Analytics Database]:" or "[Patient Portal → Analytics Database]:"
+
+2. WHAT THEY'RE DOING (X)
    - Be specific about what activity in the selected text triggers the regulation
    - Reference the document architecture to explain the context
-   - Example: "storing patient vitals in the Analytics Database"
+   - Example: "storing patient vitals without encryption"
 
-2. THE REGULATION (Y) + DESCRIPTION
+3. THE REGULATION (Y) + DESCRIPTION
    - Cite the specific HIPAA section from the research above
    - Describe what it requires in plain language
    - Example: "§ 164.312(a)(1) which requires unique user identification for PHI access"
 
-3. THE FINE RANGE
+4. THE FINE RANGE
    - State how severe the penalties can be
    - Use ranges, not specific cases
    - Example: "fines up to $1.5M per violation category"
 
-4. THE ACTION
+5. THE ACTION
    - Specific technical action to comply (from the research)
    - Example: "Implement role-based access with automatic session timeouts"
 
 EXAMPLE COMMENT:
-"Since you're storing patient vitals in your Analytics Database without mentioning access controls, you should be aware of § 164.312(a)(1) which requires unique user identification for all PHI access. Violations can result in fines up to $50,000 per incident. Implement role-based access control with automatic session timeouts and audit logging."
+"[Analytics Database]: Since you're storing patient vitals without mentioning access controls, you should be aware of § 164.312(a)(1) which requires unique user identification for all PHI access. Violations can result in fines up to $50,000 per incident. Implement role-based access control with automatic session timeouts and audit logging."
 
 ============================================================
 OUTPUT FORMAT
@@ -104,17 +113,19 @@ Return JSON only:
     {{
       "target_quote": "EXACT substring from SELECTED TEXT",
       "severity": "low|medium|high",
-      "comment": "Since you're doing [X], you should be aware of [regulation Y] which [description]. Violations can result in [fine range]. [Action to take]."
+      "related_components": ["Component Name 1", "Source → Target"],
+      "comment": "[Component Name]: Since you're doing [X], you should be aware of [regulation Y] which [description]. Violations can result in [fine range]. [Action to take]."
     }}
   ]
 }}
 
 Constraints:
 - Produce 3 to 8 comments
-- Every comment MUST follow the "Since you're doing X... regulation Y which [requires]... fines [range]... Action" format
+- Every comment MUST start with [Component/Data Flow Name]: prefix
+- Every comment MUST follow the "[Component]: Since you're doing X... regulation Y... fines [range]... Action" format
+- The related_components array MUST list all components/data flows this issue applies to
 - Do NOT include specific company names or enforcement case anecdotes
 - Every target_quote must appear VERBATIM in SELECTED TEXT
-- Reference specific components or data flows from the architecture
 - If no regulations were found, return empty list
 """
 
@@ -152,20 +163,92 @@ def _validate_citations(comments: List[Dict[str, Any]], provided_sections: List[
     Validate that all citations in comments reference regulations that were provided.
     Logs warnings for any ungrounded citations.
     """
-    provided_set = set(provided_sections)
+    # Normalize provided sections to base section numbers (e.g., "164.312")
+    # provided_sections contains strings like "§ 164.312(a)(2)(iv) - Encryption and Decryption"
+    provided_base_sections = set()
+    for section in provided_sections:
+        # Extract base section number from full regulation string
+        match = re.search(r'(\d{3}\.\d{3})', section)
+        if match:
+            provided_base_sections.add(match.group(1))
 
     for i, comment in enumerate(comments):
         comment_text = comment.get("comment", "")
         cited_sections = _extract_citations_from_comment(comment_text)
 
         for section in cited_sections:
-            if section not in provided_set:
+            if section not in provided_base_sections:
                 logger.warning(
                     f"GROUNDING ISSUE: Comment {i+1} cites § {section} which was NOT in provided regulations. "
-                    f"Provided sections: {provided_sections}"
+                    f"Provided base sections: {sorted(provided_base_sections)}"
                 )
             else:
                 logger.debug(f"Citation validated: § {section} is in provided regulations")
+
+
+def _is_comment_complete(comment_text: str) -> bool:
+    """
+    Check if a comment is complete (not truncated mid-sentence).
+
+    A complete comment should:
+    1. End with proper punctuation (. ! ) or ")
+    2. Not end with common incomplete patterns
+    3. Have reasonable length
+    """
+    if not comment_text or len(comment_text) < 20:
+        return False
+
+    text = comment_text.strip()
+
+    # Check for proper ending punctuation
+    valid_endings = ('.', '!', ')', '"', "'")
+    if not text.endswith(valid_endings):
+        return False
+
+    # Check for incomplete patterns (ends mid-thought)
+    incomplete_patterns = [
+        r'\s+and$',           # "...and"
+        r'\s+or$',            # "...or"
+        r'\s+the$',           # "...the"
+        r'\s+a$',             # "...a"
+        r'\s+to$',            # "...to"
+        r'\s+with$',          # "...with"
+        r'\s+for$',           # "...for"
+        r'\s+such\s+as$',     # "...such as"
+        r'\s+including$',     # "...including"
+        r'\s+e\.g\.$',        # "...e.g."
+        r'\s+i\.e\.$',        # "...i.e."
+        r',\s*$',             # ends with comma
+        r':\s*$',             # ends with colon
+        r';\s*$',             # ends with semicolon
+    ]
+
+    for pattern in incomplete_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            return False
+
+    return True
+
+
+def _filter_incomplete_comments(comments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Filter out incomplete comments that were truncated mid-sentence.
+    Returns only complete, well-formed comments.
+    """
+    complete_comments = []
+
+    for i, comment in enumerate(comments):
+        comment_text = comment.get("comment", "")
+
+        if _is_comment_complete(comment_text):
+            complete_comments.append(comment)
+        else:
+            logger.warning(
+                f"INCOMPLETE COMMENT: Comment {i+1} appears truncated and will be excluded. "
+                f"Ending: '...{comment_text[-50:] if len(comment_text) > 50 else comment_text}'"
+            )
+
+    return complete_comments
 
 
 def _format_sanity_structure(
@@ -242,177 +325,6 @@ def _format_sanity_structure(
         parts.append(f"\n### Summary\n{'; '.join(summary_parts)}")
 
     return "\n".join(parts)
-
-def run_review(
-    selection: str,
-    mode: ReviewMode = "general",
-    doc_title: str = "",
-    doc_text: Optional[str] = None,
-    google_doc_id: Optional[str] = None,
-) -> ReviewResponse:
-    """
-    Runs an LLM review on the highlighted selection.
-
-    mode="general": your original behavior
-    mode="privacy": privacy-only review that uses full document structure for context
-
-    Args:
-        selection: The highlighted text to review
-        mode: Review mode ("general" or "privacy")
-        doc_title: Document title
-        doc_text: Full document text - if provided, the document structure will be
-                  parsed to give the reviewer full architectural context
-        google_doc_id: Google Doc ID - used to persist/reuse document graph in Sanity
-    """
-    start_time = time.time()
-    selection = (selection or "").strip()
-
-    logger.info(f"=== Starting review request ===")
-    logger.info(f"Mode: {mode}")
-    logger.info(f"Selection length: {len(selection)} chars")
-    logger.info(f"Full document provided: {'yes' if doc_text else 'no'}")
-    logger.info(f"Google Doc ID: {google_doc_id or '(not provided)'}")
-    logger.debug(f"Selection preview: {selection[:200]}..." if len(selection) > 200 else f"Selection: {selection}")
-
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    logger.info(f"Using model: {model}")
-
-    # Track provided regulation sections for validation
-    provided_regulation_sections: List[str] = []
-
-    # Track parsed structure to return to caller (for passing to apply phase)
-    parsed_components: Optional[List[Dict[str, Any]]] = None
-    parsed_data_flows: Optional[List[Dict[str, Any]]] = None
-
-    if mode == "privacy":
-        # Parse document structure for LLM context (no Sanity persistence during review)
-        document_structure_str = ""
-
-        if doc_text and len(doc_text.strip()) > 100:
-            logger.info("--- Parsing Document Structure (no Sanity persistence) ---")
-            parse_start = time.time()
-            try:
-                # Import here to avoid circular imports
-                from document_orchestrator import DocumentGraphOrchestrator
-
-                orchestrator = DocumentGraphOrchestrator()
-                # Use parse_document_structure instead of get_or_create_design_document
-                # This avoids creating orphaned documents in Sanity during review phase
-                doc_result = orchestrator.parse_document_structure(doc_text)
-
-                components = doc_result.get("components", [])
-                data_flows = doc_result.get("data_flows", [])
-
-                # Store for returning to caller (Chrome extension will pass back during apply)
-                parsed_components = components
-                parsed_data_flows = data_flows
-
-                document_structure_str = _format_sanity_structure(components, data_flows)
-                parse_elapsed = (time.time() - parse_start) * 1000
-                logger.info(f"Document structure parsed in {parse_elapsed:.1f}ms")
-                logger.info(f"  Components: {len(components)}")
-                logger.info(f"  Data flows: {len(data_flows)}")
-            except Exception as e:
-                logger.warning(f"Failed to parse document structure: {e}")
-                document_structure_str = "Document structure could not be parsed. Review based on selected text only."
-        else:
-            document_structure_str = "Full document not provided. Review based on selected text only."
-            logger.info("No full document provided - reviewing selection only")
-
-        # Research HIPAA regulations using You.com web search
-        logger.info(f"--- Researching HIPAA Regulations via Web ---")
-        reg_start = time.time()
-        regulation_research = research_hipaa_regulations(
-            selection=selection,
-            components=parsed_components,
-            data_flows=parsed_data_flows,
-            max_regulations=5,
-        )
-        reg_elapsed = (time.time() - reg_start) * 1000
-        logger.info(f"Regulation research completed in {reg_elapsed:.1f}ms")
-
-        # Track which sections we're providing to the LLM
-        regulations = regulation_research.get("regulations", [])
-        provided_regulation_sections = [reg.get("regulation", "") for reg in regulations]
-
-        logger.info(f"Found {len(regulations)} relevant regulations")
-        for reg in regulations:
-            logger.info(f"  - {reg.get('regulation', 'Unknown')}")
-            logger.info(f"    Requires: {reg.get('description', '')[:100]}...")
-
-        hipaa_context = format_regulations_for_review_prompt(regulation_research)
-        logger.debug(f"HIPAA context for prompt ({len(hipaa_context)} chars):\n{hipaa_context[:500]}...")
-
-        system = SYSTEM_PRIVACY
-        user = USER_TMPL_PRIVACY.format(
-            doc_title=doc_title or "Untitled Document",
-            document_structure=document_structure_str,
-            hipaa_regulations=hipaa_context,
-            selection=selection,
-        )
-
-    # Log prompt sizes
-    logger.info(f"--- LLM Request ---")
-    logger.info(f"System prompt: {len(system)} chars")
-    logger.info(f"User prompt: {len(user)} chars")
-    logger.info(f"Total prompt size: {len(system) + len(user)} chars")
-
-    llm_start = time.time()
-    resp = client.chat.completions.create(
-        model=model,
-        temperature=0.2,
-        max_tokens=4096,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    )
-    llm_elapsed = (time.time() - llm_start) * 1000
-
-    text = resp.choices[0].message.content or ""
-    logger.info(f"--- LLM Response ---")
-    logger.info(f"LLM call completed in {llm_elapsed:.1f}ms")
-    logger.info(f"Response length: {len(text)} chars")
-    if hasattr(resp, 'usage') and resp.usage:
-        logger.info(f"Token usage - prompt: {resp.usage.prompt_tokens}, completion: {resp.usage.completion_tokens}, total: {resp.usage.total_tokens}")
-
-    text = _strip_code_fences(text)
-    logger.debug(f"Parsed response: {text[:500]}..." if len(text) > 500 else f"Parsed response: {text}")
-
-    data = json.loads(text)
-
-    # Extra guard (optional but useful): ensure privacy mode returns privacy-only types
-    if mode == "privacy":
-        for c in data.get("inline_comments", []):
-            c["type"] = "privacy"
-
-    comments = data.get("inline_comments", [])
-    total_elapsed = (time.time() - start_time) * 1000
-
-    logger.info(f"--- Review Complete ---")
-    logger.info(f"Generated {len(comments)} comments")
-    for i, c in enumerate(comments):
-        comment_preview = c.get('comment', '')[:100]
-        logger.info(f"  Comment {i+1}: severity={c.get('severity')}")
-        logger.info(f"    quote: '{c.get('target_quote', '')[:50]}...'")
-        logger.info(f"    comment: '{comment_preview}...'")
-
-    # Validate citations against provided regulations
-    if mode == "privacy" and provided_regulation_sections:
-        logger.info(f"--- Citation Validation ---")
-        _validate_citations(comments, provided_regulation_sections)
-
-    logger.info(f"Total review time: {total_elapsed:.1f}ms")
-
-    # Add parsed structure to response (for passing to apply phase)
-    if parsed_components is not None:
-        data["parsed_components"] = parsed_components
-    if parsed_data_flows is not None:
-        data["parsed_data_flows"] = parsed_data_flows
-
-    return ReviewResponse.model_validate(data)
-
 
 def run_review_with_status(
     selection: str,
@@ -568,6 +480,14 @@ def run_review_with_status(
 
     comments = data.get("inline_comments", [])
     total_elapsed = (time.time() - start_time) * 1000
+
+    # Filter out incomplete comments
+    original_count = len(comments)
+    comments = _filter_incomplete_comments(comments)
+    data["inline_comments"] = comments
+
+    if len(comments) < original_count:
+        status.warning(f"Filtered out {original_count - len(comments)} incomplete comments")
 
     # Emit comment summary
     if comments:

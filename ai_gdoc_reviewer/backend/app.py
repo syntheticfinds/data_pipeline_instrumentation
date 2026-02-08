@@ -3,7 +3,6 @@ import logging
 import sys
 import uuid
 import json
-import threading
 from typing import Optional, Literal, Dict, Any, List
 
 from dotenv import load_dotenv
@@ -17,8 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from review_llm import run_review_with_status
 from schemas import ReviewResponse
-from document_orchestrator import process_document_with_review_status, DocumentGraphOrchestrator
-from status_stream import StatusEmitter, create_session, get_session, remove_session
+from status_stream import create_session, get_session
 
 # Configure logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -34,7 +32,6 @@ logging.basicConfig(
 
 # Set log levels for our modules
 logging.getLogger("review_llm").setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
-logging.getLogger("sanity_client").setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logging.getLogger("web_research").setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logging.getLogger("document_orchestrator").setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
@@ -53,8 +50,6 @@ async def startup_event():
     logger.info("AI GDoc Reviewer Backend Starting")
     logger.info(f"Log level: {LOG_LEVEL}")
     logger.info(f"OpenAI model: {os.getenv('OPENAI_MODEL', 'gpt-4o-mini')}")
-    logger.info(f"Sanity project: {os.getenv('SANITY_PROJECT_ID', 'ukousf31')}")
-    logger.info(f"Sanity dataset: {os.getenv('SANITY_DATASET', 'production')}")
     logger.info("=" * 60)
 
 app.add_middleware(
@@ -184,260 +179,110 @@ async def stream_status(session_id: str):
     )
 
 
-@app.post("/session/create")
-def create_status_session():
-    """Create a new status session and return the session ID."""
-    session_id = str(uuid.uuid4())
-    create_session(session_id)
-    return {"session_id": session_id}
+# ---------- Modification Generation ----------
 
-
-@app.delete("/session/{session_id}")
-def delete_status_session(session_id: str):
-    """Delete a status session."""
-    remove_session(session_id)
-    return {"deleted": True}
-
-
-# ---------- Document Graph Orchestrator Endpoints ----------
-
-from typing import List
 from pydantic import Field
 
-class OrchestratorRequest(BaseModel):
-    """Request for the document graph orchestrator."""
-    doc_text: str = Field(..., description="Full text of the design document")
-    doc_title: str = Field(..., description="Title of the document")
-    google_doc_id: Optional[str] = Field(None, description="Google Doc ID for write-back")
-    google_doc_url: Optional[str] = Field(None, description="Google Doc URL")
+class ComponentTarget(BaseModel):
+    """Target component or data flow for a modification."""
+    name: str = Field(..., description="Name of the component or data flow")
+    target_type: str = Field(..., description="'component' or 'data_flow'")
+
+
+class SimpleModification(BaseModel):
+    """A modification targeting a specific component or data flow."""
+    index: int = Field(..., description="Index of this modification")
+    target: ComponentTarget = Field(..., description="The component or data flow to modify")
+    modification: str = Field(..., description="Description of what changes are needed")
+    issue_reference: str = Field(..., description="The compliance issue this addresses")
+    severity: str = Field("medium", description="Severity: low, medium, high")
+
+
+class GenerateModificationsRequest(BaseModel):
+    """Request for generating modifications without Sanity."""
     review_comments: List[Dict[str, Any]] = Field(
-        ..., description="Privacy review comments to process"
+        ..., description="Privacy review comments"
     )
-    # Pre-parsed structure from review phase (avoids re-parsing)
-    parsed_components: Optional[List[Dict[str, Any]]] = Field(
-        None, description="Pre-parsed components from review phase"
+    parsed_components: List[Dict[str, Any]] = Field(
+        ..., description="Parsed technical components from the document"
     )
-    parsed_data_flows: Optional[List[Dict[str, Any]]] = Field(
-        None, description="Pre-parsed data flows from review phase"
+    parsed_data_flows: List[Dict[str, Any]] = Field(
+        default_factory=list, description="Parsed data flows from the document"
     )
-    # Session ID for status streaming
     session_id: Optional[str] = Field(None, description="Session ID for status streaming")
 
 
-class ActionResult(BaseModel):
-    """Result of a Sanity Agent Action execution."""
-    action_type: str = Field(..., description="Type of action: generate, transform, image, replace")
-    target: str = Field(..., description="Target document ID")
-    success: bool = Field(..., description="Whether the action succeeded")
-    error: Optional[str] = Field(None, description="Error message if action failed")
-
-
-class TargetSection(BaseModel):
-    """Target section for a guided modification."""
-    title: str = Field(..., description="Section title or 'New Section' if adding new")
-    is_new: bool = Field(False, description="Whether this should be a new section")
-
-
-class GuidedModification(BaseModel):
-    """A single modification for guided user walkthrough."""
-    index: int = Field(..., description="Index of this modification in the list")
-    suggestion_id: str = Field(..., description="Sanity suggestion document ID")
-    modification_text: str = Field(..., description="The text/content to add to the document")
-    target_section: TargetSection = Field(..., description="Which section to add this to")
-    issue_reference: str = Field(..., description="The compliance issue this addresses")
-    severity: str = Field("medium", description="Severity: low, medium, high")
-    action_type: str = Field("generate", description="Type of modification action")
-
-
-class OrchestratorResponse(BaseModel):
-    """Response from the document graph orchestrator."""
-    design_doc_id: Optional[str] = Field(None, description="Sanity document ID for the graph")
-    issue_ids: List[str] = Field(default_factory=list, description="Created compliance issue IDs")
-    suggestion_ids: List[str] = Field(default_factory=list, description="Created modification suggestion IDs")
-    action_results: List[ActionResult] = Field(
-        default_factory=list,
-        description="Results from executing Sanity Agent Actions"
+class GenerateModificationsResponse(BaseModel):
+    """Response with generated modifications."""
+    modifications: List[SimpleModification] = Field(
+        default_factory=list, description="Generated modifications"
     )
-    guided_modifications: List[GuidedModification] = Field(
-        default_factory=list,
-        description="Structured modifications for guided user walkthrough"
-    )
-    error: Optional[str] = Field(None, description="Error message if processing failed")
+    error: Optional[str] = Field(None, description="Error message if generation failed")
 
 
-@app.post("/orchestrate-modifications", response_model=OrchestratorResponse)
-def orchestrate_modifications(req: OrchestratorRequest, x_api_key: str = Header(default="")):
+@app.post("/generate-modifications", response_model=GenerateModificationsResponse)
+def generate_modifications(req: GenerateModificationsRequest, x_api_key: str = Header(default="")):
     """
-    Full document graph pipeline:
-    1. Parse document into graph structure in Sanity
-    2. Create compliance issues from review comments
-    3. Decide and create modification suggestions
-    4. Return suggestions for Google Docs write-back
+    Generate modification suggestions based on review comments and parsed components/data flows.
+
+    This is a simplified flow that doesn't use Sanity - it directly generates
+    modifications targeting specific components or data flows.
     """
     logger.info("=" * 60)
-    logger.info("Received /orchestrate-modifications request")
+    logger.info("Received /generate-modifications request")
 
     expected = os.getenv("REVIEWER_API_KEY", "")
     if not expected or x_api_key != expected:
         logger.warning("Unauthorized request - invalid API key")
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    if not req.doc_text or len(req.doc_text.strip()) < 100:
-        raise HTTPException(status_code=400, detail="Document text too short")
-
     if not req.review_comments:
         raise HTTPException(status_code=400, detail="No review comments provided")
 
-    logger.info(f"Document: {req.doc_title}")
-    logger.info(f"Document length: {len(req.doc_text)} chars")
+    if not req.parsed_components and not req.parsed_data_flows:
+        raise HTTPException(status_code=400, detail="No components or data flows provided")
+
     logger.info(f"Review comments: {len(req.review_comments)}")
-    logger.info(f"Google Doc ID: {req.google_doc_id or '(not provided)'}")
-    logger.info(f"Pre-parsed structure: {'yes' if req.parsed_components else 'no'}")
+    logger.info(f"Components: {len(req.parsed_components)}")
+    logger.info(f"Data flows: {len(req.parsed_data_flows)}")
 
     # Get or create status emitter for this session
     session_id = req.session_id or str(uuid.uuid4())
     status = get_session(session_id) or create_session(session_id)
 
-    # Check for Sanity API token
-    if not os.getenv("SANITY_API_TOKEN"):
-        logger.error("SANITY_API_TOKEN not configured")
-        status.error("Sanity API token not configured")
-        raise HTTPException(
-            status_code=500,
-            detail="Sanity API token not configured. Set SANITY_API_TOKEN env var."
-        )
-
     try:
-        result = process_document_with_review_status(
-            doc_text=req.doc_text,
-            doc_title=req.doc_title,
+        from modification_generator import generate_component_modifications
+
+        status.step("Analyzing compliance issues")
+
+        modifications = generate_component_modifications(
             review_comments=req.review_comments,
-            google_doc_id=req.google_doc_id,
-            google_doc_url=req.google_doc_url,
-            parsed_components=req.parsed_components,
-            parsed_data_flows=req.parsed_data_flows,
+            components=req.parsed_components,
+            data_flows=req.parsed_data_flows,
             status=status,
         )
 
-        if "error" in result:
-            logger.error(f"Orchestrator error: {result['error']}")
-            status.error(result["error"])
-            return OrchestratorResponse(error=result["error"])
+        logger.info(f"Generated {len(modifications)} modifications")
+        status.complete(f"Generated {len(modifications)} modifications to review")
 
-        logger.info(f"Created document graph: {result.get('design_doc_id')}")
-        logger.info(f"Created {len(result.get('issue_ids', []))} compliance issues")
-        logger.info(f"Executed {len(result.get('action_results', []))} agent actions")
-        logger.info(f"Created {len(result.get('suggestion_ids', []))} modification suggestions")
-        logger.info(f"Generated {len(result.get('guided_modifications', []))} guided modifications")
-        logger.info("=" * 60)
-
-        # Convert action_results to ActionResult models
-        action_results = [
-            ActionResult(
-                action_type=ar.get("action_type", "unknown"),
-                target=ar.get("target", "unknown"),
-                success=ar.get("success", False),
-                error=ar.get("error"),
-            )
-            for ar in result.get("action_results", [])
-        ]
-
-        # Convert guided_modifications to GuidedModification models
-        guided_modifications = [
-            GuidedModification(
-                index=gm.get("index", i),
-                suggestion_id=gm.get("suggestion_id", ""),
-                modification_text=gm.get("modification_text", ""),
-                target_section=TargetSection(
-                    title=gm.get("target_section", {}).get("title", "Unknown Section"),
-                    is_new=gm.get("target_section", {}).get("is_new", False),
+        # Convert to response models
+        result_modifications = [
+            SimpleModification(
+                index=i,
+                target=ComponentTarget(
+                    name=mod.get("target_name", "Unknown"),
+                    target_type=mod.get("target_type", "component"),
                 ),
-                issue_reference=gm.get("issue_reference", ""),
-                severity=gm.get("severity", "medium"),
-                action_type=gm.get("action_type", "generate"),
+                modification=mod.get("modification", ""),
+                issue_reference=mod.get("issue_reference", ""),
+                severity=mod.get("severity", "medium"),
             )
-            for i, gm in enumerate(result.get("guided_modifications", []))
+            for i, mod in enumerate(modifications)
         ]
 
-        status.complete(f"Ready to apply {len(guided_modifications)} modifications")
-
-        return OrchestratorResponse(
-            design_doc_id=result.get("design_doc_id"),
-            issue_ids=result.get("issue_ids", []),
-            suggestion_ids=result.get("suggestion_ids", []),
-            action_results=action_results,
-            guided_modifications=guided_modifications,
-        )
+        return GenerateModificationsResponse(modifications=result_modifications)
 
     except Exception as e:
-        logger.exception(f"Orchestrator failed: {e}")
-        status.error(f"Orchestrator failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ---------- Cleanup Endpoint ----------
-
-class CleanupRequest(BaseModel):
-    """Request to cleanup design-related documents after modifications are applied."""
-    design_doc_id: Optional[str] = Field(None, description="Specific designDocument ID to cleanup")
-    google_doc_id: Optional[str] = Field(None, description="Google Doc ID to lookup and cleanup")
-
-
-class CleanupResponse(BaseModel):
-    """Response from cleanup operation."""
-    success: bool = Field(..., description="Whether cleanup succeeded")
-    deleted_counts: Dict[str, int] = Field(
-        default_factory=dict,
-        description="Count of deleted documents per type"
-    )
-    error: Optional[str] = Field(None, description="Error message if cleanup failed")
-
-
-@app.post("/cleanup", response_model=CleanupResponse)
-def cleanup_documents(req: CleanupRequest, x_api_key: str = Header(default="")):
-    """
-    Cleanup design-related documents from Sanity after modifications have been applied.
-
-    Call this endpoint after successfully applying suggestions to Google Docs
-    to remove the temporary graph structure from Sanity.
-    """
-    logger.info("=" * 60)
-    logger.info("Received /cleanup request")
-
-    expected = os.getenv("REVIEWER_API_KEY", "")
-    if not expected or x_api_key != expected:
-        logger.warning("Unauthorized request - invalid API key")
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    if not req.design_doc_id and not req.google_doc_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Must provide either design_doc_id or google_doc_id"
-        )
-
-    logger.info(f"Design doc ID: {req.design_doc_id or '(not provided)'}")
-    logger.info(f"Google Doc ID: {req.google_doc_id or '(not provided)'}")
-
-    try:
-        orchestrator = DocumentGraphOrchestrator()
-        deleted_counts = orchestrator.cleanup_design_documents(
-            design_doc_id=req.design_doc_id,
-            google_doc_id=req.google_doc_id,
-        )
-
-        total_deleted = sum(deleted_counts.values())
-        logger.info(f"Cleanup complete - deleted {total_deleted} documents")
-        logger.info("=" * 60)
-
-        return CleanupResponse(
-            success=True,
-            deleted_counts=deleted_counts,
-        )
-
-    except Exception as e:
-        logger.exception(f"Cleanup failed: {e}")
-        return CleanupResponse(
-            success=False,
-            deleted_counts={},
-            error=str(e),
-        )
+        logger.exception(f"Modification generation failed: {e}")
+        status.error(f"Failed: {str(e)}")
+        return GenerateModificationsResponse(error=str(e))

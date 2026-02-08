@@ -445,34 +445,77 @@ def research_hipaa_regulations(
     logger.info(f"Researching HIPAA regulations for selection ({len(selection)} chars)")
 
     # Step 1: Extract key concepts and generate search queries
-    # Format component/flow context for the prompt
+    # Format DETAILED component/flow context for the prompt
     context_str = ""
-    if components:
-        comp_names = [c.get("name", "") for c in components[:5]]
-        context_str += f"Technical components: {', '.join(comp_names)}\n"
-    if data_flows:
-        flow_names = [f.get("name", "") for f in data_flows[:3]]
-        context_str += f"Data flows: {', '.join(flow_names)}\n"
 
-    query_prompt = f"""Analyze this healthcare/AI system design text and generate 3-4 specific search queries to find:
-1. Which HIPAA regulations apply to this scenario
-2. Real enforcement cases or penalties for similar violations
-3. Specific compliance requirements
+    if components:
+        context_str += "TECHNICAL COMPONENTS:\n"
+        for comp in components[:5]:
+            name = comp.get("name", "Unknown")
+            ctype = comp.get("componentType", comp.get("component_type", ""))
+
+            # Check for PHI/PII handling
+            data_handled = comp.get("dataHandled", [])
+            phi_data = [d.get("dataType", "") for d in data_handled if isinstance(d, dict) and d.get("isPHI")]
+            pii_data = [d.get("dataType", "") for d in data_handled if isinstance(d, dict) and d.get("isPII")]
+
+            line = f"- {name}"
+            if ctype:
+                line += f" ({ctype})"
+            if phi_data:
+                line += f" [HANDLES PHI: {', '.join(phi_data[:3])}]"
+            if pii_data:
+                line += f" [HANDLES PII: {', '.join(pii_data[:3])}]"
+            context_str += line + "\n"
+
+    if data_flows:
+        context_str += "\nDATA FLOWS:\n"
+        for flow in data_flows[:5]:
+            name = flow.get("name", "")
+            source = flow.get("source", "")
+            target = flow.get("target", "")
+
+            # Get data types
+            data_types = flow.get("dataTypes", [])
+            dt_names = [d.get("dataType", str(d)) if isinstance(d, dict) else str(d) for d in data_types[:3]]
+
+            # Check encryption
+            encryption = flow.get("encryption", {})
+            encrypted = encryption.get("inTransit", False) if isinstance(encryption, dict) else False
+
+            if source and target:
+                line = f"- {source} → {target}"
+            else:
+                line = f"- {name}"
+            if dt_names:
+                line += f" (data: {', '.join(dt_names)})"
+            if not encrypted:
+                line += " [NO ENCRYPTION MENTIONED]"
+            context_str += line + "\n"
+
+    query_prompt = f"""Analyze this healthcare/AI system design and its technical components to generate 3-4 specific HIPAA search queries.
 
 SELECTED TEXT:
 {selection[:1500]}
 
-{f"SYSTEM CONTEXT:{chr(10)}{context_str}" if context_str else ""}
+{f"SYSTEM ARCHITECTURE:{chr(10)}{context_str}" if context_str else ""}
 
-Generate search queries that will find:
-- Specific HIPAA sections (e.g., "HIPAA 164.312 access controls requirements")
-- Enforcement examples (e.g., "HIPAA enforcement data breach penalties 2024")
-- Compliance consequences (e.g., "HIPAA violation fines PHI disclosure")
+Based on the components above (especially those handling PHI/PII and unencrypted data flows), generate search queries that will find:
+1. HIPAA regulations specific to the component types (e.g., databases, APIs, AI engines)
+2. Requirements for the specific data types being handled (e.g., patient vitals, medical records)
+3. Technical safeguards required for the data flows (e.g., encryption, access controls)
+4. Healthcare-specific technologies and techniques for compliance
+
+EXAMPLE QUERIES:
+- "HIPAA 164.312 database PHI encryption requirements healthcare"
+- "HIPAA AI machine learning PHI compliance safeguards"
+- "HIPAA data flow encryption in transit requirements penalties"
+- "healthcare API PHI access control audit logging HITRUST"
 
 Return JSON:
 {{
-  "queries": ["query1", "query2", "query3", "query4"],
-  "key_activities": ["what the system is doing that triggers HIPAA"]
+  "queries": ["query targeting specific component types and data handling", "query2", "query3", "query4"],
+  "key_activities": ["specific PHI-related activities that trigger HIPAA requirements"]
 }}
 
 Return ONLY the JSON."""
