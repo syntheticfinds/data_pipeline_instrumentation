@@ -22,3 +22,9 @@ model_training/review_out/
 # Never commit secrets
 .env
 **/.env
+
+# ---- MCP Google Doc server ----
+mcp-google-doc/node_modules/
+mcp-google-doc/build/
+mcp-google-doc/credentials.json
+mcp-google-doc/token.json

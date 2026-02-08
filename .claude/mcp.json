@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "google-docs": {
+      "command": "node",
+      "args": [
+        "/Users/shubham/Documents/data_pipeline_instrumentation/mcp-google-doc/build/server.js"
+      ]
+    }
+  }
+}

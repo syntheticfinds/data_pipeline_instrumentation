@@ -239,24 +239,90 @@ async function focusDoc() {
   await sleep(150);
 }
 
-// ---------- backend call ----------
-async function callBackendReview({ selection, mode, docTitle, docText }) {
-  const backendUrl = "http://localhost:8000/review"; // change when deployed
-  const apiKey = "dev_secret_key_change_me"; // move to chrome.storage later
+// ---------- backend calls ----------
+const BACKEND_URL = "http://localhost:8000"; // change when deployed
+const MCP_HTTP_URL = "http://localhost:3001"; // MCP server Express endpoint
+const API_KEY = "dev_secret_key_change_me"; // move to chrome.storage later
 
+async function callBackendReview({ selection, mode, docTitle, docText, googleDocId }) {
   console.log("Calling backend review POST...");
-  const res = await fetch(backendUrl, {
+  const res = await fetch(`${BACKEND_URL}/review`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-API-Key": apiKey,
+      "X-API-Key": API_KEY,
     },
     body: JSON.stringify({
       selection,
       mode,
       doc_title: docTitle,
       doc_text: docText,
+      google_doc_id: googleDocId,
     }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(err);
+  }
+
+  return await res.json();
+}
+
+async function callOrchestrateModifications({
+  docText,
+  docTitle,
+  googleDocId,
+  reviewComments,
+  parsedComponents,
+  parsedDataFlows,
+}) {
+  console.log("Calling backend orchestrate-modifications POST (Sanity Agent Actions)...");
+  console.log("Using pre-parsed structure:", parsedComponents ? "yes" : "no");
+  const res = await fetch(`${BACKEND_URL}/orchestrate-modifications`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-API-Key": API_KEY,
+    },
+    body: JSON.stringify({
+      doc_text: docText,
+      doc_title: docTitle,
+      google_doc_id: googleDocId,
+      review_comments: reviewComments,
+      parsed_components: parsedComponents || null,
+      parsed_data_flows: parsedDataFlows || null,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(err);
+  }
+
+  return await res.json();
+}
+
+async function callMcpApplySuggestions({ docId, suggestions }) {
+  console.log("Calling MCP server apply-suggestions POST...");
+  const res = await fetch(`${MCP_HTTP_URL}/apply-suggestions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ docId, suggestions }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(err);
+  }
+
+  return await res.json();
+}
+
+async function callMcpGetDoc({ docId }) {
+  console.log("Calling MCP server get-doc GET...");
+  const res = await fetch(`${MCP_HTTP_URL}/get-doc/${docId}`, {
+    method: "GET",
   });
 
   if (!res.ok) {
@@ -277,9 +343,6 @@ async function postSingleAnchoredCommentPrivacy(inlineComments) {
   inlineComments.slice(0, 8).forEach((c, i) => {
     body += `\n${i + 1}) [PRIVACY | ${String(c.severity || "medium").toUpperCase()}]\n`;
     body += `${c.comment}\n`;
-    if (c.rewrite_suggestion) {
-      body += `Suggested rewrite: ${c.rewrite_suggestion}\n`;
-    }
   });
 
   await focusDoc();
@@ -307,6 +370,515 @@ async function postSingleAnchoredCommentPrivacy(inlineComments) {
   }
 
   return 1;
+}
+
+// ---------- state: last review results ----------
+let lastReviewComments = null; // stored after a successful privacy review
+let lastReviewSelection = null; // the selection text that was reviewed
+let lastParsedComponents = null; // pre-parsed components from review (avoids re-parsing in apply)
+let lastParsedDataFlows = null; // pre-parsed data flows from review (avoids re-parsing in apply)
+
+// ---------- Status Panel ----------
+let statusPanel = null;
+let statusEventSource = null;
+let currentSessionId = null;
+
+function createStatusPanel() {
+  if (statusPanel) return statusPanel;
+
+  const panel = document.createElement("div");
+  panel.id = "ai-status-panel";
+  panel.style.position = "fixed";
+  panel.style.right = "20px";
+  panel.style.top = "80px";
+  panel.style.width = "320px";
+  panel.style.maxHeight = "400px";
+  panel.style.background = "#1a1a2e";
+  panel.style.border = "1px solid #333";
+  panel.style.borderRadius = "12px";
+  panel.style.boxShadow = "0 4px 20px rgba(0,0,0,0.3)";
+  panel.style.fontFamily = "ui-monospace, SFMono-Regular, Menlo, Monaco, monospace";
+  panel.style.fontSize = "12px";
+  panel.style.color = "#e0e0e0";
+  panel.style.zIndex = "999998";
+  panel.style.display = "none";
+  panel.style.flexDirection = "column";
+  panel.style.overflow = "hidden";
+
+  // Header
+  const header = document.createElement("div");
+  header.style.padding = "10px 12px";
+  header.style.borderBottom = "1px solid #333";
+  header.style.display = "flex";
+  header.style.justifyContent = "space-between";
+  header.style.alignItems = "center";
+  header.style.background = "#16213e";
+  header.style.borderRadius = "12px 12px 0 0";
+
+  const title = document.createElement("span");
+  title.textContent = "🤖 Agent Thinking";
+  title.style.fontWeight = "600";
+  title.style.color = "#fff";
+
+  const closeBtn = document.createElement("button");
+  closeBtn.textContent = "×";
+  closeBtn.style.background = "none";
+  closeBtn.style.border = "none";
+  closeBtn.style.color = "#888";
+  closeBtn.style.fontSize = "18px";
+  closeBtn.style.cursor = "pointer";
+  closeBtn.style.padding = "0 4px";
+  closeBtn.onclick = () => hideStatusPanel();
+
+  header.appendChild(title);
+  header.appendChild(closeBtn);
+
+  // Content area
+  const content = document.createElement("div");
+  content.id = "ai-status-content";
+  content.style.padding = "8px 12px";
+  content.style.overflowY = "auto";
+  content.style.flex = "1";
+  content.style.maxHeight = "340px";
+
+  panel.appendChild(header);
+  panel.appendChild(content);
+  document.body.appendChild(panel);
+
+  statusPanel = panel;
+  return panel;
+}
+
+function showStatusPanel() {
+  const panel = createStatusPanel();
+  panel.style.display = "flex";
+  clearStatusPanel();
+}
+
+function hideStatusPanel() {
+  if (statusPanel) {
+    statusPanel.style.display = "none";
+  }
+  disconnectStatusStream();
+}
+
+function clearStatusPanel() {
+  const content = document.getElementById("ai-status-content");
+  if (content) {
+    content.innerHTML = "";
+  }
+}
+
+function addStatusEntry(update) {
+  const content = document.getElementById("ai-status-content");
+  if (!content) return;
+
+  const entry = document.createElement("div");
+  entry.style.marginBottom = "8px";
+  entry.style.lineHeight = "1.4";
+
+  const typeColors = {
+    step: "#58a6ff",     // Blue for major steps
+    info: "#8b949e",     // Gray for info
+    detail: "#6e7681",   // Darker gray for details
+    success: "#3fb950",  // Green for success
+    warning: "#d29922",  // Yellow for warnings
+    error: "#f85149",    // Red for errors
+    complete: "#a371f7", // Purple for completion
+  };
+
+  const typeIcons = {
+    step: "▸",
+    info: "  •",
+    detail: "    ◦",
+    success: "✓",
+    warning: "⚠",
+    error: "✗",
+    complete: "★",
+  };
+
+  const type = update.type || "info";
+  const icon = typeIcons[type] || "•";
+  const color = typeColors[type] || "#8b949e";
+
+  entry.style.color = color;
+
+  if (type === "step") {
+    entry.style.fontWeight = "600";
+    entry.style.marginTop = "12px";
+  } else if (type === "detail") {
+    entry.style.fontSize = "11px";
+  }
+
+  entry.textContent = `${icon} ${update.message}`;
+
+  content.appendChild(entry);
+  content.scrollTop = content.scrollHeight;
+}
+
+// ---------- Guided Modifications UI ----------
+
+let currentModificationIndex = 0;
+let currentModifications = [];
+let onModificationComplete = null;
+
+function showGuidedModifications(modifications, onComplete) {
+  console.log("showGuidedModifications called with", modifications.length, "modifications");
+
+  currentModifications = modifications;
+  currentModificationIndex = 0;
+  onModificationComplete = onComplete;
+
+  if (modifications.length === 0) {
+    addStatusEntry({ type: "warning", message: "No modifications to apply" });
+    return;
+  }
+
+  // Ensure panel is visible and has correct display style
+  const panel = createStatusPanel();
+  panel.style.display = "flex";
+
+  // Update panel header
+  updatePanelHeader(`📋 Modifications (${modifications.length})`);
+
+  // Show first modification
+  showCurrentModification();
+
+  console.log("Guided modifications panel should now be visible");
+}
+
+function updatePanelHeader(text) {
+  const panel = statusPanel || createStatusPanel();
+  const header = panel.querySelector("div > span");
+  if (header) {
+    header.textContent = text;
+  }
+}
+
+function showCurrentModification() {
+  console.log("showCurrentModification called, index:", currentModificationIndex);
+
+  const content = document.getElementById("ai-status-content");
+  if (!content) {
+    console.error("Could not find ai-status-content element!");
+    return;
+  }
+
+  const mod = currentModifications[currentModificationIndex];
+  if (!mod) {
+    console.error("No modification at index", currentModificationIndex);
+    return;
+  }
+
+  console.log("Showing modification:", mod);
+
+  const total = currentModifications.length;
+  const current = currentModificationIndex + 1;
+
+  content.innerHTML = "";
+
+  // Progress indicator
+  const progress = document.createElement("div");
+  progress.style.marginBottom = "12px";
+  progress.style.padding = "8px 10px";
+  progress.style.background = "#16213e";
+  progress.style.borderRadius = "8px";
+  progress.style.display = "flex";
+  progress.style.justifyContent = "space-between";
+  progress.style.alignItems = "center";
+
+  const progressText = document.createElement("span");
+  progressText.textContent = `Modification ${current} of ${total}`;
+  progressText.style.fontWeight = "600";
+  progressText.style.color = "#58a6ff";
+
+  const severityBadge = document.createElement("span");
+  const severityColors = { low: "#3fb950", medium: "#d29922", high: "#f85149" };
+  severityBadge.textContent = mod.severity.toUpperCase();
+  severityBadge.style.fontSize = "10px";
+  severityBadge.style.padding = "2px 6px";
+  severityBadge.style.borderRadius = "4px";
+  severityBadge.style.background = severityColors[mod.severity] || "#d29922";
+  severityBadge.style.color = "#000";
+  severityBadge.style.fontWeight = "600";
+
+  progress.appendChild(progressText);
+  progress.appendChild(severityBadge);
+  content.appendChild(progress);
+
+  // Target Section
+  const sectionBox = document.createElement("div");
+  sectionBox.style.marginBottom = "12px";
+  sectionBox.style.padding = "10px";
+  sectionBox.style.background = "#1a1a2e";
+  sectionBox.style.borderRadius = "8px";
+  sectionBox.style.borderLeft = "3px solid #58a6ff";
+
+  const sectionLabel = document.createElement("div");
+  sectionLabel.textContent = "📍 Target Section";
+  sectionLabel.style.fontSize = "10px";
+  sectionLabel.style.color = "#8b949e";
+  sectionLabel.style.marginBottom = "4px";
+  sectionLabel.style.textTransform = "uppercase";
+  sectionLabel.style.letterSpacing = "0.5px";
+
+  const sectionTitle = document.createElement("div");
+  sectionTitle.textContent = mod.target_section.title;
+  sectionTitle.style.fontWeight = "600";
+  sectionTitle.style.color = mod.target_section.is_new ? "#a371f7" : "#fff";
+  if (mod.target_section.is_new) {
+    sectionTitle.textContent += " (NEW)";
+  }
+
+  sectionBox.appendChild(sectionLabel);
+  sectionBox.appendChild(sectionTitle);
+  content.appendChild(sectionBox);
+
+  // Modification Text
+  const modBox = document.createElement("div");
+  modBox.style.marginBottom = "12px";
+  modBox.style.padding = "10px";
+  modBox.style.background = "#1a1a2e";
+  modBox.style.borderRadius = "8px";
+  modBox.style.borderLeft = "3px solid #3fb950";
+
+  const modLabel = document.createElement("div");
+  modLabel.textContent = "✏️ Add This Text";
+  modLabel.style.fontSize = "10px";
+  modLabel.style.color = "#8b949e";
+  modLabel.style.marginBottom = "6px";
+  modLabel.style.textTransform = "uppercase";
+  modLabel.style.letterSpacing = "0.5px";
+
+  const modText = document.createElement("div");
+  modText.style.fontSize = "11px";
+  modText.style.lineHeight = "1.5";
+  modText.style.color = "#e0e0e0";
+  modText.style.whiteSpace = "pre-wrap";
+  modText.style.maxHeight = "120px";
+  modText.style.overflowY = "auto";
+  // Show first 500 chars with ellipsis
+  const displayText = mod.modification_text.length > 500
+    ? mod.modification_text.substring(0, 500) + "..."
+    : mod.modification_text;
+  modText.textContent = displayText;
+
+  // Copy button
+  const copyBtn = document.createElement("button");
+  copyBtn.textContent = "📋 Copy to Clipboard";
+  copyBtn.style.marginTop = "8px";
+  copyBtn.style.padding = "6px 10px";
+  copyBtn.style.fontSize = "11px";
+  copyBtn.style.borderRadius = "6px";
+  copyBtn.style.border = "1px solid #3fb950";
+  copyBtn.style.background = "transparent";
+  copyBtn.style.color = "#3fb950";
+  copyBtn.style.cursor = "pointer";
+  copyBtn.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(mod.modification_text);
+      copyBtn.textContent = "✓ Copied!";
+      copyBtn.style.background = "#3fb950";
+      copyBtn.style.color = "#000";
+      setTimeout(() => {
+        copyBtn.textContent = "📋 Copy to Clipboard";
+        copyBtn.style.background = "transparent";
+        copyBtn.style.color = "#3fb950";
+      }, 2000);
+    } catch (e) {
+      copyBtn.textContent = "Copy failed";
+    }
+  };
+
+  modBox.appendChild(modLabel);
+  modBox.appendChild(modText);
+  modBox.appendChild(copyBtn);
+  content.appendChild(modBox);
+
+  // Issue Reference
+  const issueBox = document.createElement("div");
+  issueBox.style.marginBottom = "12px";
+  issueBox.style.padding = "10px";
+  issueBox.style.background = "#1a1a2e";
+  issueBox.style.borderRadius = "8px";
+  issueBox.style.borderLeft = "3px solid #d29922";
+
+  const issueLabel = document.createElement("div");
+  issueLabel.textContent = "📌 Addresses Issue";
+  issueLabel.style.fontSize = "10px";
+  issueLabel.style.color = "#8b949e";
+  issueLabel.style.marginBottom = "4px";
+  issueLabel.style.textTransform = "uppercase";
+  issueLabel.style.letterSpacing = "0.5px";
+
+  const issueText = document.createElement("div");
+  issueText.style.fontSize = "11px";
+  issueText.style.color = "#d29922";
+  issueText.style.fontStyle = "italic";
+  issueText.style.lineHeight = "1.4";
+  // Show first 200 chars
+  const issuePreview = mod.issue_reference.length > 200
+    ? mod.issue_reference.substring(0, 200) + "..."
+    : mod.issue_reference;
+  issueText.textContent = `"${issuePreview}"`;
+
+  issueBox.appendChild(issueLabel);
+  issueBox.appendChild(issueText);
+  content.appendChild(issueBox);
+
+  // Navigation buttons
+  const navRow = document.createElement("div");
+  navRow.style.display = "flex";
+  navRow.style.gap = "8px";
+  navRow.style.marginTop = "8px";
+
+  if (currentModificationIndex > 0) {
+    const prevBtn = document.createElement("button");
+    prevBtn.textContent = "← Previous";
+    prevBtn.style.flex = "1";
+    prevBtn.style.padding = "10px";
+    prevBtn.style.borderRadius = "8px";
+    prevBtn.style.border = "1px solid #444";
+    prevBtn.style.background = "transparent";
+    prevBtn.style.color = "#e0e0e0";
+    prevBtn.style.cursor = "pointer";
+    prevBtn.style.fontSize = "12px";
+    prevBtn.onclick = () => {
+      currentModificationIndex--;
+      showCurrentModification();
+    };
+    navRow.appendChild(prevBtn);
+  }
+
+  const nextBtn = document.createElement("button");
+  const isLast = currentModificationIndex >= total - 1;
+  nextBtn.textContent = isLast ? "✓ Done" : "Next →";
+  nextBtn.style.flex = "1";
+  nextBtn.style.padding = "10px";
+  nextBtn.style.borderRadius = "8px";
+  nextBtn.style.border = "none";
+  nextBtn.style.background = isLast ? "#3fb950" : "#58a6ff";
+  nextBtn.style.color = "#000";
+  nextBtn.style.cursor = "pointer";
+  nextBtn.style.fontWeight = "600";
+  nextBtn.style.fontSize = "12px";
+  nextBtn.onclick = () => {
+    if (isLast) {
+      // All done
+      if (onModificationComplete) {
+        onModificationComplete();
+      }
+    } else {
+      currentModificationIndex++;
+      showCurrentModification();
+    }
+  };
+  navRow.appendChild(nextBtn);
+
+  content.appendChild(navRow);
+}
+
+function generateSessionId() {
+  return "session-" + Math.random().toString(36).substring(2, 15);
+}
+
+function connectStatusStream(sessionId) {
+  disconnectStatusStream();
+
+  currentSessionId = sessionId;
+  const url = `${BACKEND_URL}/status/${sessionId}`;
+
+  console.log("Connecting to status stream:", url);
+
+  statusEventSource = new EventSource(url);
+
+  statusEventSource.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      if (data.type === "done" || data.type === "timeout") {
+        disconnectStatusStream();
+      } else {
+        addStatusEntry(data);
+      }
+    } catch (e) {
+      console.warn("Failed to parse status event:", e);
+    }
+  };
+
+  statusEventSource.onerror = (e) => {
+    console.warn("Status stream error:", e);
+    disconnectStatusStream();
+  };
+}
+
+function disconnectStatusStream() {
+  if (statusEventSource) {
+    statusEventSource.close();
+    statusEventSource = null;
+  }
+  currentSessionId = null;
+}
+
+// Modified backend call functions that include session ID
+async function callBackendReviewWithStatus({ selection, mode, docTitle, docText, googleDocId, sessionId }) {
+  console.log("Calling backend review POST with session:", sessionId);
+  const res = await fetch(`${BACKEND_URL}/review`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-API-Key": API_KEY,
+    },
+    body: JSON.stringify({
+      selection,
+      mode,
+      doc_title: docTitle,
+      doc_text: docText,
+      google_doc_id: googleDocId,
+      session_id: sessionId,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(err);
+  }
+
+  return await res.json();
+}
+
+async function callOrchestrateModificationsWithStatus({
+  docText,
+  docTitle,
+  googleDocId,
+  reviewComments,
+  parsedComponents,
+  parsedDataFlows,
+  sessionId,
+}) {
+  console.log("Calling backend orchestrate-modifications POST with session:", sessionId);
+  const res = await fetch(`${BACKEND_URL}/orchestrate-modifications`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-API-Key": API_KEY,
+    },
+    body: JSON.stringify({
+      doc_text: docText,
+      doc_title: docTitle,
+      google_doc_id: googleDocId,
+      review_comments: reviewComments,
+      parsed_components: parsedComponents || null,
+      parsed_data_flows: parsedDataFlows || null,
+      session_id: sessionId,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(err);
+  }
+
+  return await res.json();
 }
 
 // ---------- UI injection ----------
@@ -374,6 +946,15 @@ function injectFloatingButtons() {
   reviewBtn.textContent = "🤖 Privacy Review";
   baseBtnStyle(reviewBtn);
 
+  // Button 3: Apply Suggestions (hidden until a review is run)
+  const applyBtn = document.createElement("button");
+  applyBtn.id = "ai-apply-btn";
+  applyBtn.textContent = "✏️ Apply Suggestions";
+  baseBtnStyle(applyBtn);
+  applyBtn.style.display = "none"; // hidden until review completes
+  applyBtn.style.background = "#e8f5e9";
+  applyBtn.style.border = "1px solid #81c784";
+
   reviewBtn.onclick = async () => {
     try {
       reviewBtn.textContent = "Running...";
@@ -392,37 +973,212 @@ function injectFloatingButtons() {
         return;
       }
 
+      // Show status panel and connect to stream
+      const sessionId = generateSessionId();
+      showStatusPanel();
+      connectStatusStream(sessionId);
+      addStatusEntry({ type: "step", message: "Starting privacy review..." });
+
       const docId = getDocIdFromUrl();
-      const docTitle = getDocTitleBestEffort();
+      let docTitle = getDocTitleBestEffort();
 
-      // Load stored context if any (recommended)
-      const storedContext = await loadContextForDoc(docId);
+      // Fetch full document via MCP for complete architectural context
+      reviewBtn.textContent = "Fetching doc...";
+      addStatusEntry({ type: "info", message: "Fetching document content..." });
+      let fullDocText = "";
+      try {
+        const docData = await callMcpGetDoc({ docId });
+        fullDocText = docData.content || "";
+        docTitle = docData.title || docTitle;
+        addStatusEntry({ type: "info", message: `Fetched ${docData.contentLength} characters` });
+      } catch (mcpErr) {
+        console.warn("Failed to fetch full doc via MCP:", mcpErr);
+        addStatusEntry({ type: "warning", message: "Could not fetch full doc, using selection only" });
+      }
 
-      // Phase 1 MVP: doc_text is optional. If missing, backend still runs privacy mode,
-      // but context-aware framework selection will be weaker.
-      const review = await callBackendReview({
+      reviewBtn.textContent = "Analyzing...";
+      addStatusEntry({ type: "step", message: "Sending to AI reviewer..." });
+
+      const review = await callBackendReviewWithStatus({
         selection,
         mode: "privacy",
         docTitle,
-        docText: storedContext || "",
+        docText: fullDocText,
+        googleDocId: docId,
+        sessionId,
       });
 
       console.log("Inline comments:", review.inline_comments);
+
+      // Hide status panel after a short delay
+      setTimeout(() => hideStatusPanel(), 2000);
 
       const posted = await postSingleAnchoredCommentPrivacy(
         review.inline_comments || []
       );
 
+      // Store results for "Apply Suggestions"
+      const commentsWithSuggestions = (review.inline_comments || []).filter(
+        (c) => c.comment
+      );
+      if (commentsWithSuggestions.length > 0) {
+        lastReviewComments = commentsWithSuggestions;
+        lastReviewSelection = selection;
+        lastParsedComponents = review.parsed_components || null;
+        lastParsedDataFlows = review.parsed_data_flows || null;
+        console.log("Stored pre-parsed structure:", {
+          components: lastParsedComponents?.length || 0,
+          dataFlows: lastParsedDataFlows?.length || 0,
+        });
+        applyBtn.style.display = "inline-block";
+      }
+
       alert(`✅ Posted ${posted} comment thread(s)`);
     } catch (e) {
+      addStatusEntry({ type: "error", message: `Error: ${e.message || e}` });
+      setTimeout(() => hideStatusPanel(), 3000);
       alert("Error: " + e);
     } finally {
       reviewBtn.textContent = "🤖 Privacy Review";
     }
   };
 
+  applyBtn.onclick = async () => {
+    if (!lastReviewComments || !lastReviewSelection) {
+      alert("No review suggestions available. Run a Privacy Review first.");
+      return;
+    }
+
+    const docId = getDocIdFromUrl();
+    if (!docId) {
+      alert("Could not detect Google Doc ID from URL.");
+      return;
+    }
+
+    const docTitle = getDocTitleBestEffort();
+
+    // Show status panel and connect to stream
+    const sessionId = generateSessionId();
+    showStatusPanel();
+    connectStatusStream(sessionId);
+    addStatusEntry({ type: "step", message: "Starting apply-suggestions flow..." });
+
+    try {
+      applyBtn.textContent = "Fetching doc...";
+      addStatusEntry({ type: "info", message: "Fetching full document content..." });
+
+      // Fetch full document content via MCP server
+      let fullDocText = "";
+      let fetchedTitle = docTitle;
+      try {
+        const docData = await callMcpGetDoc({ docId });
+        fullDocText = docData.content || "";
+        fetchedTitle = docData.title || docTitle;
+        console.log(`Fetched full document: ${docData.contentLength} chars`);
+        addStatusEntry({ type: "info", message: `Fetched ${docData.contentLength} characters` });
+      } catch (mcpErr) {
+        console.warn("Failed to fetch full doc via MCP, falling back to selection:", mcpErr);
+        addStatusEntry({ type: "warning", message: "Could not fetch full doc, using selection" });
+        // Fallback: use stored context + selection
+        const storedContext = await loadContextForDoc(docId);
+        fullDocText = storedContext
+          ? `${storedContext}\n\n---\n\n${lastReviewSelection}`
+          : lastReviewSelection;
+      }
+
+      applyBtn.textContent = "Processing...";
+      addStatusEntry({ type: "step", message: "Sending to orchestrator..." });
+
+      // Step 1: Call orchestrator to create Sanity graph + run Agent Actions
+      const commentsPayload = lastReviewComments.map((c) => ({
+        target_quote: c.target_quote,
+        comment: c.comment,
+        severity: c.severity || "medium",
+      }));
+
+      console.log("Calling orchestrate-modifications with Sanity Agent Actions...");
+      const orchestratorResult = await callOrchestrateModificationsWithStatus({
+        docText: fullDocText,
+        docTitle: fetchedTitle,
+        googleDocId: docId,
+        reviewComments: commentsPayload,
+        parsedComponents: lastParsedComponents,
+        parsedDataFlows: lastParsedDataFlows,
+        sessionId,
+      });
+
+      if (orchestratorResult.error) {
+        addStatusEntry({ type: "error", message: `Orchestrator error: ${orchestratorResult.error}` });
+        setTimeout(() => hideStatusPanel(), 3000);
+        alert("Orchestrator error: " + orchestratorResult.error);
+        applyBtn.textContent = "✏️ Apply Suggestions";
+        return;
+      }
+
+      console.log("Orchestrator result:", orchestratorResult);
+      console.log("  - Design doc ID:", orchestratorResult.design_doc_id);
+      console.log("  - Issues created:", orchestratorResult.issue_ids?.length);
+      console.log("  - Agent actions:", orchestratorResult.action_results?.length);
+      console.log("  - Guided modifications:", orchestratorResult.guided_modifications?.length);
+
+      addStatusEntry({
+        type: "success",
+        message: `Created ${orchestratorResult.issue_ids?.length || 0} compliance issues`
+      });
+
+      const modifications = orchestratorResult.guided_modifications || [];
+      console.log("Guided modifications from orchestrator:", modifications);
+      console.log("Number of modifications:", modifications.length);
+
+      if (modifications.length === 0) {
+        addStatusEntry({ type: "complete", message: "No modifications generated" });
+        setTimeout(() => hideStatusPanel(), 2000);
+        alert(
+          `✅ Sanity document graph created (${orchestratorResult.design_doc_id}).\n\n` +
+          `Created ${orchestratorResult.issue_ids?.length || 0} compliance issues.\n` +
+          `Executed ${orchestratorResult.action_results?.length || 0} Agent Actions.\n\n` +
+          `No modifications were generated. The document may already be compliant.`
+        );
+        applyBtn.textContent = "✏️ Apply Suggestions";
+        return;
+      }
+
+      addStatusEntry({ type: "step", message: `Generated ${modifications.length} modifications to review` });
+
+      // Show guided modifications in the status panel
+      showGuidedModifications(modifications, () => {
+        // Called when user clicks "Done" on last modification
+        addStatusEntry({ type: "complete", message: "All modifications reviewed!" });
+
+        // Clear stored review
+        lastReviewComments = null;
+        lastReviewSelection = null;
+        lastParsedComponents = null;
+        lastParsedDataFlows = null;
+        applyBtn.style.display = "none";
+
+        setTimeout(() => {
+          hideStatusPanel();
+          alert(
+            `✅ Reviewed ${modifications.length} modification(s).\n\n` +
+            `Copy each modification and paste it into the appropriate section of your Google Doc.`
+          );
+        }, 1500);
+      });
+
+      applyBtn.textContent = "✏️ Apply Suggestions";
+    } catch (e) {
+      addStatusEntry({ type: "error", message: `Error: ${e.message || e}` });
+      setTimeout(() => hideStatusPanel(), 3000);
+      alert("Error applying suggestions: " + e);
+    } finally {
+      applyBtn.textContent = "✏️ Apply Suggestions";
+    }
+  };
+
   wrap.appendChild(setCtxBtn);
   wrap.appendChild(reviewBtn);
+  wrap.appendChild(applyBtn);
   document.body.appendChild(wrap);
 }
 
