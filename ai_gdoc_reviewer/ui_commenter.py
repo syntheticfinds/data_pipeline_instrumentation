@@ -15,10 +15,31 @@ def _open_doc(page: Page, doc_url: str) -> None:
     page.wait_for_timeout(2500)
 
 
-def _ensure_doc_ready(page: Page) -> None:
-    page.wait_for_selector("text=File", timeout=30_000)
-    page.wait_for_selector("text=Edit", timeout=30_000)
-    page.wait_for_timeout(1000)
+def _ensure_doc_ready(page):
+    # Google Docs UI is dynamic and "File" text can vary by locale/DOM.
+    # Wait for more stable editor signals.
+    page.wait_for_load_state("domcontentloaded")
+
+    # Give the editor plenty of time to hydrate.
+    page.wait_for_timeout(2000)
+
+    # Prefer stable editor elements over menu text.
+    selectors = [
+        'div[role="document"]',                    # editor surface (often present)
+        'div.kix-appview-editor',                  # common editor container
+        'div.docs-title-input',                    # title area
+        'div[aria-label*="Document"]',             # fallback
+    ]
+
+    for sel in selectors:
+        try:
+            page.wait_for_selector(sel, timeout=90_000)
+            return
+        except Exception:
+            pass
+
+    # Last resort: take a screenshot path would be nice, but keep it simple.
+    raise TimeoutError("Google Doc did not become ready in time (editor UI not detected).")
 
 
 def _focus_doc_body(page: Page) -> None:

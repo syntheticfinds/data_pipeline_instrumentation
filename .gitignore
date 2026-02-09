@@ -21,4 +21,18 @@ model_training/review_out/
 
 # Never commit secrets
 .env
-**/.env
+**/.env# local env / secrets
+.env
+.env.local
+*.env
+
+# local keys
+keys/
+*.json
+
+# python venvs
+.venv/
+*/.venv/
+
+# macOS
+.DS_Store
