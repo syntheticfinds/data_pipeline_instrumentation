@@ -1,9 +1,12 @@
 import os
 import json
+import logging
 from typing import Optional, Literal, Dict, Any
 
 from openai import OpenAI
 from schemas import ReviewResponse
+
+logger = logging.getLogger("review_llm")
 
 ReviewMode = Literal["general", "privacy", "healthcare"]
 
@@ -471,7 +474,7 @@ Return JSON only with this schema:
   "inline_comments": [
     {{
       "target_quote": "EXACT substring from SELECTED TEXT",
-      "type": "regulatory|legal|compliance|privacy|risk|governance|bias",
+      "type": "compliance|privacy|risk|governance|bias",
       "severity": "low|medium|high",
       "comment": "Why this matters (1-2 sentences, grounded in the quote; conditional if needed)",
       "trustworthiness_property": "Property name(s) from the trustworthiness taxonomy",
@@ -602,14 +605,16 @@ def run_review(
         "fairness": "bias",
         "discrimination": "bias",
         "data_protection": "privacy",
-        "rights/risk": "regulatory",
-        "rights_risk": "regulatory",
+        "regulatory": "compliance",
+        "legal": "compliance",
+        "rights/risk": "risk",
+        "rights_risk": "risk",
+        "unknown": "risk",
     }
 
     allowed = {
         "structure", "clarity", "logic", "missing_context", "risk", "question",
         "rewrite", "compliance", "governance", "privacy", "bias",
-        "regulatory", "legal",
     }
 
     for c in data.get("inline_comments", []):
@@ -620,4 +625,93 @@ def run_review(
             c["type"] = "risk"
 
     return ReviewResponse.model_validate(data)
+
+
+def run_review_with_status(
+    selection: str,
+    mode: ReviewMode = "general",
+    doc_title: str = "",
+    doc_text: Optional[str] = None,
+    google_doc_id: Optional[str] = None,
+    status=None,
+) -> ReviewResponse:
+    """
+    Wrapper around run_review that integrates with StatusEmitter and
+    DocumentGraphOrchestrator from the refactored codebase.
+
+    Parameters match the call site in app.py.
+    """
+    if status:
+        status.step(f"Starting {mode} review")
+
+    context_pack = None
+
+    # In privacy mode with full doc text, parse for architectural context
+    if mode == "privacy" and doc_text:
+        try:
+            if status:
+                status.step("Parsing document structure")
+            from document_orchestrator import DocumentGraphOrchestrator
+
+            orchestrator = DocumentGraphOrchestrator()
+            structure = orchestrator.parse_document_structure(doc_text)
+            components = structure.get("components", [])
+            data_flows = structure.get("data_flows", [])
+
+            if status:
+                status.info(
+                    f"Found {len(components)} components, {len(data_flows)} data flows"
+                )
+
+            # Build context pack from parsed structure
+            comp_summary = "; ".join(
+                f"{c['name']} ({c.get('componentType', 'unknown')})"
+                for c in components
+            )
+            flow_summary = "; ".join(
+                f"{f.get('source', '?')} -> {f.get('target', '?')}"
+                for f in data_flows
+            )
+            privacy_signals = []
+            for c in components:
+                for dh in c.get("dataHandled", []):
+                    if dh.get("isPHI") or dh.get("isPII"):
+                        privacy_signals.append(
+                            f"{c['name']}: {dh.get('dataType', 'unknown data')}"
+                        )
+
+            context_pack = {
+                "doc_title": doc_title or "Untitled",
+                "doc_summary": doc_text[:1500],
+                "intended_use": "Infer from document",
+                "users_roles": "Infer from document",
+                "environment": "Infer from document",
+                "data_sources": comp_summary or "Infer from document",
+                "storage_retention": "Infer from document",
+                "vendors": "Infer from document",
+                "compliance": "Infer from document",
+                "privacy_signals": (
+                    "\n".join(privacy_signals) if privacy_signals
+                    else "None explicitly extracted"
+                ),
+            }
+        except Exception as e:
+            logger.warning(f"Document parsing failed, proceeding without structure: {e}")
+            if status:
+                status.warning(f"Document parsing skipped: {e}")
+
+    if status:
+        status.step("Running LLM review")
+
+    result = run_review(
+        selection=selection,
+        mode=mode,
+        context_pack=context_pack,
+        doc_title=doc_title,
+    )
+
+    if status:
+        status.complete(f"Review complete — {len(result.inline_comments)} comments")
+
+    return result
 

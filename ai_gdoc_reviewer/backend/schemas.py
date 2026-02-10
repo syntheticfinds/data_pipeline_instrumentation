@@ -14,8 +14,6 @@ CommentType = Literal[
     "governance",
     "privacy",
     "bias",
-    "regulatory",
-    "legal",
 ]
 
 class InlineComment(BaseModel):
