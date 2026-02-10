@@ -1,133 +1,494 @@
 import os
 import json
-import logging
-import time
-from typing import Optional, Literal, Dict, Any, List
+from typing import Optional, Literal, Dict, Any
 
 from openai import OpenAI
 from schemas import ReviewResponse
-from web_research import research_hipaa_regulations, format_regulations_for_review_prompt
-import re
 
-# Configure logging
-logger = logging.getLogger("review_llm")
+ReviewMode = Literal["general", "privacy", "healthcare"]
 
-ReviewMode = Literal["general", "privacy"]
+SYSTEM_GENERAL = """You are an expert reviewer for AI governance and EU AI Act readiness.
 
-SYSTEM_PRIVACY = """You are a HIPAA compliance reviewer for AI systems. You write precise, consequence-aware review comments.
+Leave short, actionable Google Doc comments.
 
-COMMENT FORMAT - Every comment MUST follow this structure:
-"[Component/Data Flow Name]: Since you're doing [X], you should be aware of [regulation Y] which [description]. Violations can result in [fine range]. [Action to take]."
-
-Where:
-- Component/Data Flow Name = The specific technical component or data flow this applies to
-- X = What the system is doing (from the selected text)
-- Y = The specific HIPAA regulation section (e.g., § 164.312)
-- Description = What the regulation requires (in plain language)
-- Fine range = How severe the penalties can be (e.g., "fines up to $1.5M per violation")
-- Action = Specific technical action to comply
-
-CRITICAL RULES:
-1. ALWAYS start with the component or data flow name in brackets, e.g., "[Patient Portal]:" or "[API → Database]:"
-2. Describe what the regulation REQUIRES, not specific enforcement cases.
-3. Mention the potential fine RANGE (e.g., "up to $50K per violation" or "fines ranging from $100 to $50K").
-4. Be specific about what the system is doing that triggers each regulation.
-5. Recommend specific technical actions from the research.
-
-OUTPUT QUALITY RULES:
-6. Every comment MUST be a complete, self-contained thought. Never leave a sentence or point unfinished.
-7. Keep comments concise (2-4 sentences). Finish every sentence.
-8. Write in plain, professional language as if advising a colleague.
-
-You must:
-- Anchor every comment to an EXACT substring from the Selected Text.
-- START every comment with the affected component/data flow in brackets.
-- Follow the "[Component]: Since you're doing X... regulation Y which [requires]... fines up to [amount]... Do [action]" format.
-- Do NOT include specific company names or enforcement case anecdotes.
-- Output JSON only.
+Rules:
+- Do not invent facts not present in the text.
+- target_quote MUST be copied exactly from the provided text (verbatim substring).
+- Prefer 3–8 comments per selection.
+- Focus on lineage, provenance, transformation intent, bias, privacy, monitoring, accountability.
+- Output JSON only matching schema.
 """
 
-USER_TMPL_PRIVACY = """============================================================
-FULL DOCUMENT ARCHITECTURE
-============================================================
-Title: {doc_title}
+SYSTEM_PRIVACY = """You are a privacy reviewer for AI systems.
 
-{document_structure}
+You write concise, actionable review comments for Google Docs.
 
-============================================================
-HIPAA REGULATIONS (from web research)
-============================================================
-{hipaa_regulations}
+You will be given:
+(1) a Document Context Pack (high-level context for the whole document)
+(2) a Selected Text block (the text the user highlighted)
 
-============================================================
-SELECTED TEXT (user-highlighted)
-============================================================
+You must:
+- Focus ONLY on privacy-related risks and mitigations.
+- Anchor every comment to an EXACT substring from Selected Text via target_quote.
+- Do not invent details that are not present in the Context Pack or Selected Text.
+- Prefer comments that lead to concrete design/test/deployment/ops actions.
+- Output JSON only matching schema.
+"""
+
+USER_TMPL_GENERAL = """Review the following selected text from a Google Doc:
+
+--- START SELECTION ---
 {selection}
+--- END SELECTION ---
 
-============================================================
-INSTRUCTIONS
-============================================================
-
-You have FULL CONTEXT of the document architecture above. Use this to understand where the selected text fits in the overall system design.
-
-For each comment, you MUST follow this format:
-"[Component/Data Flow]: Since you're doing [X], you should be aware of [regulation Y] which [description]. Violations can result in [fine range]. [Action to take]."
-
-REQUIRED ELEMENTS IN EACH COMMENT:
-
-1. COMPONENT/DATA FLOW (in brackets at the start)
-   - Identify which component or data flow from the architecture this applies to
-   - Use the exact name from the document structure
-   - For data flows, use format: "[Source → Target]:"
-   - Example: "[Analytics Database]:" or "[Patient Portal → Analytics Database]:"
-
-2. WHAT THEY'RE DOING (X)
-   - Be specific about what activity in the selected text triggers the regulation
-   - Reference the document architecture to explain the context
-   - Example: "storing patient vitals without encryption"
-
-3. THE REGULATION (Y) + DESCRIPTION
-   - Cite the specific HIPAA section from the research above
-   - Describe what it requires in plain language
-   - Example: "§ 164.312(a)(1) which requires unique user identification for PHI access"
-
-4. THE FINE RANGE
-   - State how severe the penalties can be
-   - Use ranges, not specific cases
-   - Example: "fines up to $1.5M per violation category"
-
-5. THE ACTION
-   - Specific technical action to comply (from the research)
-   - Example: "Implement role-based access with automatic session timeouts"
-
-EXAMPLE COMMENT:
-"[Analytics Database]: Since you're storing patient vitals without mentioning access controls, you should be aware of § 164.312(a)(1) which requires unique user identification for all PHI access. Violations can result in fines up to $50,000 per incident. Implement role-based access control with automatic session timeouts and audit logging."
-
-============================================================
-OUTPUT FORMAT
-============================================================
 Return JSON only:
 
 {{
   "inline_comments": [
     {{
-      "target_quote": "EXACT substring from SELECTED TEXT",
+      "target_quote": "EXACT substring from selection",
+      "type": "governance|compliance|privacy|bias|risk|clarity|logic|missing_context|question|rewrite|structure",
       "severity": "low|medium|high",
-      "related_components": ["Component Name 1", "Source → Target"],
-      "comment": "[Component Name]: Since you're doing [X], you should be aware of [regulation Y] which [description]. Violations can result in [fine range]. [Action to take]."
+      "comment": "Short actionable comment",
+      "rewrite_suggestion": "Optional"
+    }}
+  ]
+}}
+"""
+
+USER_TMPL_PRIVACY = """DOCUMENT CONTEXT PACK (whole-doc context)
+Title: {doc_title}
+
+Summary (<=400 words):
+{doc_summary}
+
+System & deployment context:
+- Intended use: {intended_use}
+- Users/roles: {users_roles}
+- Environment: {environment}
+- Data sources: {data_sources}
+- Storage & retention: {storage_retention}
+- Vendors/services: {vendors}
+- Compliance constraints mentioned: {compliance}
+
+Privacy signals already mentioned in the doc:
+{privacy_signals}
+
+---
+SELECTED TEXT (user-highlighted)
+{selection}
+
+---
+PRIVACY REVIEW RUBRIC (follow this)
+Ask yourself:
+How will privacy be built into the AI system design, testing, deployment, and operation?
+If data includes sensitive or personally identifiable information including biometrics,
+what extra precautions will be taken?
+
+Use these actions to guide your comments:
+1) Identify privacy-related values, frameworks, and attributes applicable to this context of use.
+2) Quantify privacy-level data aspects where possible:
+   - ability to identify individuals or groups
+   - k-anonymity, l-diversity, t-closeness
+   - if not measurable from this text, state what should be measured and where
+3) Establish and document protocols and access controls:
+   - authorization, duration, and data types
+   - training vs production data handling
+   - align to privacy/data governance policies
+4) Use privacy-enhancing techniques when sharing dataset information:
+   - differential privacy, aggregation, redaction
+   - define the release policy and threat model
+
+---
+OUTPUT REQUIREMENTS
+Return JSON only with this schema:
+
+{{
+  "inline_comments": [
+    {{
+      "target_quote": "EXACT substring from SELECTED TEXT",
+      "type": "privacy",
+      "severity": "low|medium|high",
+      "comment": "Actionable privacy review comment",
+      "rewrite_suggestion": "Optional suggested rewrite of the selected text"
     }}
   ]
 }}
 
 Constraints:
-- Produce 3 to 8 comments
-- Every comment MUST start with [Component/Data Flow Name]: prefix
-- Every comment MUST follow the "[Component]: Since you're doing X... regulation Y... fines [range]... Action" format
-- The related_components array MUST list all components/data flows this issue applies to
-- Do NOT include specific company names or enforcement case anecdotes
-- Every target_quote must appear VERBATIM in SELECTED TEXT
-- If no regulations were found, return empty list
+- Produce 3 to 8 comments.
+- Every target_quote must appear verbatim in SELECTED TEXT.
+- If the selected text contains no privacy-relevant content, return an empty list.
 """
+
+SYSTEM_HEALTHCARE = """\
+========================
+Healthcare Legal & Regulatory Lens (Trustworthy AI Reviewer)
+========================
+
+ROLE EXTENSION
+You are a regulatory- and legal-risk-aware reviewer for AI systems used in healthcare contexts.
+Your job is NOT to provide legal advice. Your job IS to:
+- Flag regulatory/legal compliance risks that are evidenced or implied by the selected text/context pack.
+- Ask for missing documentation/controls in a precise, actionable way.
+- Always anchor each comment to an exact substring from the selected text (Target quote).
+
+HARD CONSTRAINTS (do not violate)
+1) Anchor every comment to an exact substring from the selected text using: Target quote: "<verbatim substring>"
+2) Do not invent facts (jurisdiction, FDA status, HIPAA coverage, etc.) not present in the context pack or selected text.
+3) Use conditional language when applicability is unclear:
+   - "If this system processes PHI..." / "If this is intended for diagnosis..." / "If deployed in the EU..."
+4) Prefer concrete design/test/deployment/ops asks over abstract principles.
+
+OUTPUT FORMAT (each comment)
+- Target quote: "<exact substring from selected text>"
+- Trustworthiness property: <property name(s) from the taxonomy>
+- Compliance label: Regulatory | Legal | Rights/Risk (can list multiple)
+- Why this matters: <1-2 sentences, grounded in the quote; conditional if needed>
+- Regulatory/legal reference(s): <use citations from the Regulatory Reference Index below; do not hallucinate new citations>
+- Action / evidence to add: <what to add/change/test; what artifact proves it>
+
+PRIORITIZATION
+- Prioritize comments that indicate (1) patient harm risk, (2) privacy/security breach risk, (3) discrimination/civil-rights risk, (4) unsubstantiated clinical/marketing claims risk, (5) missing governance/monitoring/auditability.
+
+---------------------------------------
+REGULATORY REFERENCE INDEX (use only these citations)
+---------------------------------------
+
+US — Privacy & Security (HIPAA/HITECH)
+[HIPAA-PR] HIPAA Privacy Rule (uses/disclosures + authorization + access/amend rights):
+  - 45 CFR 164.502 (general rules for uses/disclosures)
+  - 45 CFR 164.508 (authorization)
+  - 45 CFR 164.524 (right of access)
+  - 45 CFR 164.526 (right to amend)
+[HIPAA-SR] HIPAA Security Rule (risk analysis + safeguards + documentation):
+  - 45 CFR 164.306 (general rules)
+  - 45 CFR 164.308(a)(1)(ii)(A) (risk analysis)
+  - 45 CFR 164.308(a)(1)(ii)(B) (risk management)
+  - 45 CFR 164.312 (technical safeguards: access control, audit controls, integrity, transmission security)
+  - 45 CFR 164.314 (organizational requirements)
+  - 45 CFR 164.316 (policies/procedures & documentation)
+[HIPAA-BN] HIPAA Breach Notification Rule:
+  - 45 CFR 164.400-414 (incl. 164.402 definitions; 164.404 notification to individuals)
+
+US — Substance Use Disorder (SUD) confidentiality
+[42CFRP2] 42 CFR Part 2 (esp. consent requirements):
+  - 42 CFR 2.31 (consent requirements)
+
+US — Consumer health apps / direct-to-consumer health data
+[FTC-HBNR] FTC Health Breach Notification Rule:
+  - 16 CFR Part 318
+[FTC-UDAP] FTC Act Section 5 (unfair/deceptive acts or practices):
+  - 15 U.S.C. S45
+[STATE-HEALTHDATA] Example state consumer health data law:
+  - Washington My Health My Data Act: RCW 19.373
+
+US — Health IT interoperability / access
+[ONC-IB] ONC Information Blocking:
+  - 45 CFR Part 171
+
+US — Medical device / SaMD / CDS / AI-enabled device change management
+[FDA-CDS] FDA Guidance: "Clinical Decision Support Software" (Final, January 2026; discusses Non-Device CDS criteria under FD&C Act S520(o)(1)(E))
+[FDA-QMSR] Quality Management System Regulation:
+  - 21 CFR Part 820
+[FDA-MDR] Medical Device Reporting:
+  - 21 CFR Part 803
+[FDA-PCCP] FDA Guidance: "Marketing Submission Recommendations for a Predetermined Change Control Plan for Artificial Intelligence-Enabled Device Software Functions" (Final, August 2025)
+[FDA-Part11] Electronic records & electronic signatures:
+  - 21 CFR Part 11
+
+US — Civil rights / nondiscrimination in healthcare programs
+[ACA1557] Section 1557 implementing regs:
+  - 45 CFR Part 92 (esp. 45 CFR 92.210: nondiscrimination in patient care decision support tools)
+[ADA] Americans with Disabilities Act:
+  - 42 U.S.C. S12101 et seq.; implementing regs include 28 CFR Part 35 (Title II) and 28 CFR Part 36 (Title III)
+[Rehab504] Rehabilitation Act S504:
+  - 29 U.S.C. S794
+
+EU — Data protection
+[GDPR] Regulation (EU) 2016/679 (GDPR). Commonly triggered articles:
+  - Art 5 (principles), Art 6 (lawful basis), Art 9 (special categories: health data)
+  - Art 12-14 (transparency), Art 15-22 (data subject rights; incl. Art 22 automated decision-making)
+  - Art 32 (security), Art 33-34 (breach notification), Art 35 (DPIA)
+
+EU — AI regulation
+[EU-AIA] Regulation (EU) 2024/1689 (EU AI Act). Commonly triggered for high-risk systems:
+  - Art 9 (risk management), Art 10 (data governance), Art 11 (technical documentation),
+    Art 12 (record-keeping/logging), Art 13 (transparency/instructions), Art 14 (human oversight),
+    Art 15 (accuracy/robustness/cybersecurity)
+  - Post-market/incident: Art 72-73 (post-market monitoring & serious incident reporting)
+
+EU — Medical devices
+[EU-MDR] Regulation (EU) 2017/745 (Medical Device Regulation)
+
+---------------------------------------
+COMPLIANCE "BUCKETS" (how to turn flags into concrete asks)
+---------------------------------------
+
+B1 — Clinical safety & medical device / clinical decision support compliance
+Trigger cues: "diagnosis", "treatment recommendation", "clinical decision support", "triage", "risk score", "predicts outcomes",
+              "medical device", "clearance", "CE", "clinical validation", "real-world performance", "intended use"
+Refs: [FDA-CDS], [FDA-QMSR], [FDA-MDR], [FDA-PCCP], [EU-AIA], [EU-MDR]
+Action patterns: ask for intended use + claim boundary; clinical validation plan; performance metrics; risk management plan;
+                 change-control for model updates; post-market monitoring + adverse event reporting plan.
+
+B2 — Privacy, consent, data minimization, data subject/patient rights
+Trigger cues: "patient data", "EHR", "PHI", "identifiable", "consent", "authorization", "de-identified", "retain", "share", "third party",
+              "research", "opt-out", "delete", "rectification"
+Refs: [HIPAA-PR], [42CFRP2], [GDPR], [STATE-HEALTHDATA], [FTC-UDAP]
+Action patterns: ask for data classification (PHI vs non-PHI); lawful basis/authorization/consent flow; retention/deletion;
+                 rights handling (access/amend/delete); data sharing terms; de-identification method claims + verification.
+
+B3 — Security, cybersecurity, incident readiness, breach response
+Trigger cues: "security", "encryption", "access", "logging", "audit", "cloud", "vendor", "breach", "monitoring", "SOC2",
+              "adversarial", "model theft", "prompt injection", "PII leak"
+Refs: [HIPAA-SR], [HIPAA-BN], [FTC-HBNR], [GDPR], [EU-AIA]
+Action patterns: ask for HIPAA-style risk analysis; technical safeguards (access control, audit logs); incident response & breach notification plan;
+                 vulnerability management; monitoring; least privilege; secure-by-default configs.
+
+B4 — Nondiscrimination, equity, accessibility, civil-rights compliance
+Trigger cues: "eligibility", "coverage", "denial", "prior authorization", "resource allocation", "risk stratification",
+              "bias", "fairness", "protected class", "disparities", "accessible", "disability", "language"
+Refs: [ACA1557], [ADA], [Rehab504], [GDPR], [EU-AIA]
+Action patterns: ask for bias risk assessment; subgroup performance metrics; monitoring for discriminatory outputs;
+                 accessibility testing; governance for model use in patient-care decisions.
+
+B5 — Transparency, explanations, user-facing labeling, marketing/claims, informed use
+Trigger cues: "accurate", "clinically proven", "FDA approved", "explain", "interpret", "confidence", "limitations",
+              "users will", "disclaimer", "informed consent", "automated decision"
+Refs: [FDA-CDS], [FTC-UDAP], [GDPR], [EU-AIA]
+Action patterns: ask for clear disclosure of AI use; limitations; intended users; uncertainty display; instructions for safe use; claims substantiation.
+
+B6 — Governance, documentation, auditability, accountability, change management
+Trigger cues: "policy", "governance", "roles", "audit", "documentation", "review", "monitor", "update model", "post-market",
+              "quality management", "SOP", "compliance"
+Refs: [FDA-QMSR], [FDA-Part11], [HIPAA-SR], [EU-AIA]
+Action patterns: ask for QMS/SOPs; change control; traceability; logging; internal reviews; audit artifacts; documentation updates.
+
+B7 — Patient/user access, interoperability, data access constraints
+Trigger cues: "access to records", "EHR integration", "API", "share data", "block", "withhold", "export", "portability"
+Refs: [ONC-IB], [HIPAA-PR], [GDPR]
+Action patterns: ask to clarify how access requests are handled; whether any "blocking" is intended; document applicable exceptions & workflows.
+
+B8 — Third-party dependencies, vendor oversight, supply chain
+Trigger cues: "vendor", "third party", "processor", "subcontractor", "cloud provider", "external model", "open source",
+              "supply chain", "dependency"
+Refs: [HIPAA-SR], [HIPAA-PR], [FTC-HBNR], [GDPR], [EU-AIA]
+Action patterns: ask for BAA/processor agreements; vendor security assessment; subprocessor inventory; data flow diagram; contractual restrictions.
+
+---------------------------------------
+CROSSWALK: Trustworthiness Properties -> Compliance Labels + Buckets
+---------------------------------------
+1) Fit for Purpose -> Regulatory/Legal -> B1, B5, B6
+2) Predictable and Dependable -> Regulatory -> B1, B6
+3) Appropriate Level Of Automation -> Regulatory/Legal -> B1, B5, B6
+4) High Quality AI System Configuration -> Regulatory -> B1, B3, B6
+5) High Quality Network Resources and Services -> Regulatory -> B3, B6
+6) Trusted Dependencies on External Parties -> Regulatory/Legal -> B8, B3, B2
+7) Foresight and Scenario Planning -> Regulatory/Rights-Risk -> B1, B6
+8) Protection of Physical and Psychological Safety -> Regulatory -> B1
+9) Assurance / Management of Uncertainty -> Regulatory -> B1, B6
+10) Assurance / Management of MultiCapability / MultiModal Systems -> Regulatory -> B1, B6, B5
+11) Alignment with Human Values -> Rights/Risk
+12) Governable -> Regulatory -> B1, B6
+13) Diverse -> Rights/Risk
+14) Inclusive -> Rights/Risk
+15) Equitable -> Legal/Regulatory -> B4
+16) Just -> Rights/Risk
+17) Mitigation of Systemic and Human Bias -> Legal/Regulatory -> B4, B1
+18) Solidarity with groups/communities -> Rights/Risk
+19) Security-by-Design -> Regulatory -> B3, B6
+20) Availability (info available to authorized personnel) -> Regulatory -> B3, B7
+21) Confidentiality -> Regulatory -> B2, B3
+22) Integrity -> Regulatory -> B3, B6, B1
+23) Intelligible -> Regulatory/Legal -> B5
+24) Positive Human-Machine Interaction -> Rights/Risk
+25) Privacy-by-Design -> Regulatory -> B2, B3
+26) Data Privacy/Protection Impact Assessment -> Regulatory -> B2, B6
+27) Effective Policy and Governance -> Regulatory -> B6
+28) Adherence to the Rule of Law -> Regulatory/Legal -> B6
+29) Coordination (public/private; international) -> Rights/Risk
+30) Effective Risk & Impact Assessments -> Regulatory -> B6, B1
+31) Community Engagement -> Rights/Risk
+32) Open -> Regulatory/Rights-Risk -> B5, B6
+33) Documentation -> Regulatory -> B6
+34) Internal Reporting Culture of Safety -> Regulatory -> B6, B1
+35) Internal Reviews -> Regulatory -> B6
+36) Responsible Use in High-stakes Settings (incl. healthcare) -> Regulatory/Legal -> B1, B4, B6
+37) Responsible Use in Critical Infrastructure/Safety-critical -> Regulatory -> B1, B3, B6
+38) Responsible Use in Criminal Legal System -> Rights/Risk
+39) Responsible Use in Defense/National Security -> Rights/Risk
+40) Verified Supply Chain -> Regulatory -> B8, B3, B6
+41) Roles/Authorities/Responsibilities; Points of Contact -> Regulatory -> B6
+42) Effective Capabilities -> Rights/Risk
+43) Collaboration -> Rights/Risk
+44) Supportive Governance & Org Structure -> Regulatory -> B6
+45) Effective Hiring & Training -> Regulatory -> B6
+46) Responsible Labor Practices & Rights -> Rights/Risk
+47) Supportive Organizational Culture -> Rights/Risk
+48) Procurement Standards -> Regulatory -> B8, B6
+49) Relationships/Interdependencies/Interconnections -> Regulatory -> B8, B6
+50) Alignment with Org Vision/Mission/Values -> Rights/Risk
+51) Socially Responsible -> Rights/Risk
+52) Supportive of Fair Competition -> Legal/Rights-Risk
+53) Supportive of Civil Rights -> Legal/Regulatory -> B4
+54) Supportive of Democratic Values/Processes -> Rights/Risk
+55) Protection of Human Autonomy/Freedom -> Rights/Risk
+56) Protection of Human Dignity -> Rights/Risk
+57) Protection of Human Rights -> Rights/Risk
+58) Supportive of Wellbeing -> Rights/Risk
+59) Reduction of Carbon Emissions -> Rights/Risk
+60) Assessment of Econ/Social/Cultural/Political/Global Implications -> Rights/Risk
+61) Data Completeness -> Regulatory -> B1, B4, B6
+62) Data Quality -> Regulatory -> B1, B6
+63) Responsible Data / Information Flows -> Regulatory -> B2, B6, B7
+64) Data Stability -> Regulatory -> B1, B6
+65) Data Balance -> Legal/Regulatory -> B4, B1, B6
+66) Data Security -> Regulatory -> B3
+67) Data Protection -> Regulatory -> B2, B3
+68) Data Processing Oversight -> Regulatory -> B3, B6
+69) Consent to Use of Data -> Regulatory/Legal -> B2
+70) Control of Use of Data (rectification/erasure) -> Regulatory -> B2, B7
+71) Data Governance -> Regulatory -> B2, B6, B8
+72) Traceable (provenance) -> Regulatory -> B6, B3, B1
+73) Efficient Data Centers -> Rights/Risk
+74) Accurate -> Regulatory -> B1, B4, B6
+75) Reproducible -> Regulatory -> B1, B6
+76) Efficient -> Rights/Risk
+77) Safely Interruptible -> Regulatory -> B1, B6
+78) Loyal -> Rights/Risk
+79) Power-averse -> Rights/Risk
+80) Containment -> Regulatory -> B3
+81) Mitigation of Computational Bias -> Legal/Regulatory -> B4, B1
+82) Protection Against Trojans -> Regulatory -> B3
+83) Built-in Defenses -> Regulatory -> B3
+84) Interpretable Uncertainty -> Regulatory -> B1, B5
+85) Model Protection -> Regulatory -> B3, B2
+86) System Honesty -> Legal/Regulatory -> B5
+87) Reduction of Computational Requirements -> Rights/Risk
+88) Verifiable -> Regulatory -> B6, B1, B3
+89) Reliable -> Regulatory -> B1, B6
+90) Replayable -> Regulatory -> B6, B3
+91) Effective -> Regulatory -> B1
+92) Valid -> Regulatory -> B1, B6
+93) Appropriate Capabilities for the Tasks -> Regulatory -> B1, B6
+94) Appropriate System Design/Training for the Tasks -> Regulatory -> B1, B6
+95) Protection from Proxy Gaming -> Regulatory -> B1, B6
+96) Review (errors/inconsistencies) -> Regulatory -> B6, B1
+97) Non-Discrimination -> Legal/Regulatory -> B4, B1
+98) Robust -> Regulatory -> B3, B1
+99) Resilient -> Regulatory -> B1, B3
+100) Protection from Unwarranted Data Access -> Regulatory -> B3, B2
+101) Future Projections of System/Environmental Changes -> Regulatory/Rights-Risk -> B6
+102) Generalizable -> Regulatory -> B1
+103) Complexity of Networks/Dependencies -> Regulatory -> B8, B3, B6
+104) Usable -> Legal/Regulatory -> B5, B4
+105) Effective Detection of Anomalies -> Regulatory -> B1, B3
+106) Accessible -> Legal/Regulatory -> B4, B5
+107) Use of Adversarial Testing -> Regulatory -> B3, B1
+108) Interpretable -> Legal/Regulatory -> B5
+109) Responsible Publication/Disclosure -> Regulatory/Rights-Risk -> B3, B6
+110) Information-sharing (with authorities/stakeholders) -> Regulatory -> B6
+111) User Testing & Engagement; UX -> Legal/Regulatory -> B5, B4
+112) Proactive Communication (AI disclosure) -> Legal/Regulatory -> B5
+113) Beneficial to Society -> Rights/Risk
+114) Continuous Monitoring -> Regulatory -> B6, B1, B3
+115) Maintaining Quality Over Time -> Regulatory -> B6, B1
+116) Acceptable and Desirable -> Rights/Risk
+117) Human Agency -> Regulatory/Rights-Risk -> B5
+118) Human Control -> Regulatory -> B6, B1
+119) Human Oversight -> Regulatory -> B6, B1
+120) Appropriate Retirement -> Regulatory -> B6
+121) Iterative Learning & Improvements -> Regulatory -> B6, B1
+122) Re-evaluation -> Regulatory -> B6, B1
+123) Continual Learning Assurance -> Regulatory -> B6, B1
+124) Awareness of Functional Evolution -> Regulatory -> B6, B1
+125) Emergent Functionalities Assurance -> Regulatory -> B6, B1
+126) Shared Benefit -> Rights/Risk
+127) Auditable -> Regulatory -> B6, B3, B1
+128) Prevention of Significant Adverse Impacts -> Regulatory/Legal -> B1, B4, B6
+129) Prevention of Malicious/Harmful Synthetic Content -> Regulatory/Rights-Risk -> B5
+130) Prevention of Misuses and Abuses -> Regulatory/Legal -> B6, B3, B8
+131) Prevention of Social/Behavioral Manipulation -> Legal/Rights-Risk -> B5
+132) Environmental Implications -> Rights/Risk
+133) Oversight of Third-Party Uses -> Regulatory -> B8, B6, B3
+134) Implications Over Time -> Regulatory/Rights-Risk -> B6
+135) Engagement with Impacted Communities -> Rights/Risk
+136) Effective Feedback -> Regulatory/Rights-Risk -> B5, B6
+137) Incident Reporting -> Regulatory -> B6
+138) Fair Access to AI Tools/Services -> Legal/Rights-Risk -> B4
+139) Vulnerability Disclosure -> Regulatory/Rights-Risk -> B3, B6
+140) Relevant Explanation -> Legal/Regulatory -> B5
+141) Effective Notification (breach/incident) -> Regulatory -> B3, B2
+142) Contestability (appeals) -> Legal/Regulatory -> B5, B4
+143) Redress/Recourse -> Legal/Rights-Risk -> B4, B6
+144) Engagement with Global Governance -> Rights/Risk
+145) Data & System Accessibility (to authorities/researchers) -> Regulatory/Rights-Risk -> B7, B6
+146) Informed Consent of Use -> Regulatory/Legal -> B2, B5
+147) Ability to Opt Out -> Regulatory/Legal -> B2, B5
+148) Consumer Protection -> Legal/Regulatory -> B5, B2
+149) Due Process and Protection (whistleblowers/NGOs/trade unions) -> Rights/Risk
+"""
+
+USER_TMPL_HEALTHCARE = """\
+DOCUMENT CONTEXT PACK (whole-doc context)
+Title: {doc_title}
+
+Summary (<=400 words):
+{doc_summary}
+
+System & deployment context:
+- Intended use: {intended_use}
+- Users/roles: {users_roles}
+- Environment: {environment}
+- Data sources: {data_sources}
+- Storage & retention: {storage_retention}
+- Vendors/services: {vendors}
+- Compliance constraints mentioned: {compliance}
+
+Privacy signals already mentioned in the doc:
+{privacy_signals}
+
+---
+SELECTED TEXT (user-highlighted)
+{selection}
+
+---
+HEALTHCARE REGULATORY REVIEW INSTRUCTIONS
+Using the Healthcare Legal & Regulatory Lens from your system prompt:
+1) Scan the selected text for trigger cues from any compliance bucket (B1-B8).
+2) For each flagged issue, produce a comment following the output format.
+3) Prioritize: (1) patient harm, (2) privacy/security breach, (3) discrimination/civil-rights, \
+(4) unsubstantiated claims, (5) missing governance/auditability.
+4) Use conditional language when jurisdiction or applicability is unclear.
+5) Cite ONLY from the Regulatory Reference Index provided in the system prompt.
+
+---
+OUTPUT REQUIREMENTS
+Return JSON only with this schema:
+
+{{
+  "inline_comments": [
+    {{
+      "target_quote": "EXACT substring from SELECTED TEXT",
+      "type": "regulatory|legal|compliance|privacy|risk|governance|bias",
+      "severity": "low|medium|high",
+      "comment": "Why this matters (1-2 sentences, grounded in the quote; conditional if needed)",
+      "trustworthiness_property": "Property name(s) from the trustworthiness taxonomy",
+      "compliance_label": "Regulatory | Legal | Rights/Risk (can list multiple)",
+      "regulatory_references": "[REF-TAG] specific CFR/article citations",
+      "action_evidence": "What to add/change/test; what artifact proves it",
+      "rewrite_suggestion": "Optional suggested rewrite"
+    }}
+  ]
+}}
+
+Constraints:
+- Produce 3 to 10 comments.
+- Every target_quote must appear verbatim in SELECTED TEXT.
+- If the selected text contains no healthcare regulatory/legal content, return an empty list.
+"""
+
 
 def _strip_code_fences(s: str) -> str:
     s = (s or "").strip()
@@ -137,391 +498,126 @@ def _strip_code_fences(s: str) -> str:
             s = s[len("json\n") :]
     return s.strip()
 
-def _extract_citations_from_comment(comment: str) -> List[str]:
-    """Extract regulation citations (e.g., § 160.102, 160.504) from a comment."""
-    # Match patterns like § 160.102, §160.102, 160.102, § 160.102(a), etc.
-    patterns = [
-        r'§\s*(\d{3}\.\d{3}(?:\([a-z0-9]+\))?)',  # § 160.102 or § 160.102(a)
-        r'(?<![0-9])(\d{3}\.\d{3})(?:\([a-z0-9]+\))?(?![0-9])',  # 160.102 standalone
-    ]
-    citations = []
-    for pattern in patterns:
-        matches = re.findall(pattern, comment, re.IGNORECASE)
-        citations.extend(matches)
-    # Normalize to just the section number (e.g., 160.102)
-    normalized = []
-    for c in citations:
-        # Extract just the base section number
-        match = re.match(r'(\d{3}\.\d{3})', c)
-        if match:
-            normalized.append(match.group(1))
-    return list(set(normalized))
-
-
-def _validate_citations(comments: List[Dict[str, Any]], provided_sections: List[str]) -> None:
+def _default_context_pack(doc_title: str = "") -> Dict[str, Any]:
     """
-    Validate that all citations in comments reference regulations that were provided.
-    Logs warnings for any ungrounded citations.
+    Safe defaults so the caller can omit context_pack without breaking prompts.
     """
-    # Normalize provided sections to base section numbers (e.g., "164.312")
-    # provided_sections contains strings like "§ 164.312(a)(2)(iv) - Encryption and Decryption"
-    provided_base_sections = set()
-    for section in provided_sections:
-        # Extract base section number from full regulation string
-        match = re.search(r'(\d{3}\.\d{3})', section)
-        if match:
-            provided_base_sections.add(match.group(1))
+    return {
+        "doc_title": doc_title or "Untitled document",
+        "doc_summary": "Context not provided. Infer only from the selected text.",
+        "intended_use": "Unknown",
+        "users_roles": "Unknown",
+        "environment": "Unknown",
+        "data_sources": "Unknown",
+        "storage_retention": "Unknown",
+        "vendors": "Unknown",
+        "compliance": "Unknown",
+        "privacy_signals": "None explicitly mentioned in context pack.",
+    }
 
-    for i, comment in enumerate(comments):
-        comment_text = comment.get("comment", "")
-        cited_sections = _extract_citations_from_comment(comment_text)
-
-        for section in cited_sections:
-            if section not in provided_base_sections:
-                logger.warning(
-                    f"GROUNDING ISSUE: Comment {i+1} cites § {section} which was NOT in provided regulations. "
-                    f"Provided base sections: {sorted(provided_base_sections)}"
-                )
-            else:
-                logger.debug(f"Citation validated: § {section} is in provided regulations")
-
-
-def _is_comment_complete(comment_text: str) -> bool:
-    """
-    Check if a comment is complete (not truncated mid-sentence).
-
-    A complete comment should:
-    1. End with proper punctuation (. ! ) or ")
-    2. Not end with common incomplete patterns
-    3. Have reasonable length
-    """
-    if not comment_text or len(comment_text) < 20:
-        return False
-
-    text = comment_text.strip()
-
-    # Check for proper ending punctuation
-    valid_endings = ('.', '!', ')', '"', "'")
-    if not text.endswith(valid_endings):
-        return False
-
-    # Check for incomplete patterns (ends mid-thought)
-    incomplete_patterns = [
-        r'\s+and$',           # "...and"
-        r'\s+or$',            # "...or"
-        r'\s+the$',           # "...the"
-        r'\s+a$',             # "...a"
-        r'\s+to$',            # "...to"
-        r'\s+with$',          # "...with"
-        r'\s+for$',           # "...for"
-        r'\s+such\s+as$',     # "...such as"
-        r'\s+including$',     # "...including"
-        r'\s+e\.g\.$',        # "...e.g."
-        r'\s+i\.e\.$',        # "...i.e."
-        r',\s*$',             # ends with comma
-        r':\s*$',             # ends with colon
-        r';\s*$',             # ends with semicolon
-    ]
-
-    for pattern in incomplete_patterns:
-        if re.search(pattern, text, re.IGNORECASE):
-            return False
-
-    return True
-
-
-def _filter_incomplete_comments(comments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Filter out incomplete comments that were truncated mid-sentence.
-    Returns only complete, well-formed comments.
-    """
-    complete_comments = []
-
-    for i, comment in enumerate(comments):
-        comment_text = comment.get("comment", "")
-
-        if _is_comment_complete(comment_text):
-            complete_comments.append(comment)
-        else:
-            logger.warning(
-                f"INCOMPLETE COMMENT: Comment {i+1} appears truncated and will be excluded. "
-                f"Ending: '...{comment_text[-50:] if len(comment_text) > 50 else comment_text}'"
-            )
-
-    return complete_comments
-
-
-def _format_sanity_structure(
-    components: List[Dict[str, Any]],
-    data_flows: List[Dict[str, Any]],
-) -> str:
-    """
-    Format Sanity component and data flow documents into a readable string for the LLM prompt.
-    """
-    parts = []
-
-    # Format components
-    if components:
-        parts.append("### Technical Components")
-        for comp in components:
-            name = comp.get("name", "Unknown")
-            ctype = comp.get("componentType", comp.get("component_type", ""))
-            desc = comp.get("description", "")[:150]  # Tech stack is now in description
-
-            # Check for PHI/PII in dataHandled
-            data_handled = comp.get("dataHandled", [])
-            has_phi = any(d.get("isPHI") for d in data_handled if isinstance(d, dict))
-            has_pii = any(d.get("isPII") for d in data_handled if isinstance(d, dict))
-            phi = "⚠️ Handles PHI" if has_phi else ""
-            pii = "⚠️ Handles PII" if has_pii else ""
-            flags = " ".join(filter(None, [phi, pii]))
-
-            line = f"- **{name}** ({ctype})"
-            if flags:
-                line += f" [{flags}]"
-            parts.append(line)
-            if desc:
-                parts.append(f"  {desc}")
-
-    # Format data flows
-    if data_flows:
-        parts.append("\n### Data Flows")
-        for flow in data_flows:
-            # Handle both Sanity reference format and direct name format
-            name = flow.get("name", "")
-            if " -> " in name:
-                source, target = name.split(" -> ", 1)
-            else:
-                source = flow.get("source", "?")
-                target = flow.get("target", "?")
-
-            data_types = flow.get("dataTypes", [])
-            dt_names = [d.get("dataType", d) if isinstance(d, dict) else str(d) for d in data_types[:3]]
-
-            # Check encryption status
-            encryption = flow.get("encryption", {})
-            encrypted = encryption.get("inTransit", False) if isinstance(encryption, dict) else False
-            enc_flag = "🔒 Encrypted" if encrypted else ""
-
-            line = f"- {source} → {target}"
-            if dt_names:
-                line += f": {', '.join(dt_names)}"
-            if enc_flag:
-                line += f" [{enc_flag}]"
-            parts.append(line)
-
-    if not parts:
-        return "No document structure available."
-
-    # Add summary
-    summary_parts = []
-    if components:
-        phi_components = [c.get("name") for c in components
-                        if any(d.get("isPHI") for d in c.get("dataHandled", []) if isinstance(d, dict))]
-        if phi_components:
-            summary_parts.append(f"PHI handling: {', '.join(phi_components[:3])}")
-
-    if summary_parts:
-        parts.append(f"\n### Summary\n{'; '.join(summary_parts)}")
-
-    return "\n".join(parts)
-
-def run_review_with_status(
+def run_review(
     selection: str,
     mode: ReviewMode = "general",
+    context_pack: Optional[Dict[str, Any]] = None,
     doc_title: str = "",
-    doc_text: Optional[str] = None,
-    google_doc_id: Optional[str] = None,
-    status: Optional["StatusEmitter"] = None,
 ) -> ReviewResponse:
     """
-    Runs an LLM review with status updates for the frontend.
+    Runs an LLM review on the highlighted selection.
 
-    Same as run_review but emits status updates to the StatusEmitter
-    for real-time progress display.
+    mode="general": your original behavior
+    mode="privacy": privacy-only review that follows the rubric and uses doc context
+    mode="healthcare": healthcare regulatory/legal lens that flags compliance risks
     """
-    from status_stream import StatusEmitter
-
-    # Create a no-op emitter if none provided
-    if status is None:
-        status = StatusEmitter()
-
-    start_time = time.time()
     selection = (selection or "").strip()
-
-    status.step("Starting privacy review")
-
-    logger.info(f"=== Starting review request ===")
-    logger.info(f"Mode: {mode}")
-    logger.info(f"Selection length: {len(selection)} chars")
-    logger.info(f"Full document provided: {'yes' if doc_text else 'no'}")
-    logger.info(f"Google Doc ID: {google_doc_id or '(not provided)'}")
 
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-    # Track provided regulation sections for validation
-    provided_regulation_sections: List[str] = []
+    if mode in ("privacy", "healthcare"):
+        ctx = _default_context_pack(doc_title=doc_title)
+        if context_pack:
+            # merge user-provided context over defaults
+            ctx.update({k: v for k, v in context_pack.items() if v is not None})
 
-    # Track parsed structure to return to caller (for passing to apply phase)
-    parsed_components: Optional[List[Dict[str, Any]]] = None
-    parsed_data_flows: Optional[List[Dict[str, Any]]] = None
-
-    if mode == "privacy":
-        # Parse document structure for LLM context (no Sanity persistence during review)
-        document_structure_str = ""
-
-        if doc_text and len(doc_text.strip()) > 100:
-            status.step("Synthesizing where selected sections fit into overall design")
-
-            parse_start = time.time()
-            try:
-                from document_orchestrator import DocumentGraphOrchestrator
-
-                orchestrator = DocumentGraphOrchestrator()
-                doc_result = orchestrator.parse_document_structure(doc_text)
-
-                components = doc_result.get("components", [])
-                data_flows = doc_result.get("data_flows", [])
-
-                # Store for returning to caller
-                parsed_components = components
-                parsed_data_flows = data_flows
-
-                document_structure_str = _format_sanity_structure(components, data_flows)
-                parse_elapsed = (time.time() - parse_start) * 1000
-
-                # Emit component and data flow details
-                if components:
-                    comp_names = [c.get("name", "Unknown") for c in components[:5]]
-                    status.info(
-                        f"Found {len(components)} technical components",
-                        {"components": comp_names}
-                    )
-                    status.detail(f"Components: {', '.join(comp_names)}")
-
-                if data_flows:
-                    flow_names = [f.get("name", "Unknown") for f in data_flows[:3]]
-                    status.info(
-                        f"Found {len(data_flows)} data flows",
-                        {"data_flows": flow_names}
-                    )
-
-            except Exception as e:
-                logger.warning(f"Failed to parse document structure: {e}")
-                status.warning("Could not parse document structure")
-                document_structure_str = "Document structure could not be parsed. Review based on selected text only."
-        else:
-            document_structure_str = "Full document not provided. Review based on selected text only."
-            status.info("Reviewing selection without full document context")
-
-        # Research HIPAA regulations using You.com web search
-        status.step("Researching relevant HIPAA regulations")
-
-        reg_start = time.time()
-        regulation_research = research_hipaa_regulations(
-            selection=selection,
-            components=parsed_components,
-            data_flows=parsed_data_flows,
-            max_regulations=5,
-        )
-        reg_elapsed = (time.time() - reg_start) * 1000
-
-        # Track which sections we're providing to the LLM
-        regulations = regulation_research.get("regulations", [])
-        provided_regulation_sections = [reg.get("regulation", "") for reg in regulations]
-
-        if regulations:
-            status.info(
-                f"Found {len(regulations)} relevant regulations",
-                {"regulations": provided_regulation_sections}
+        if mode == "healthcare":
+            system = SYSTEM_HEALTHCARE
+            user = USER_TMPL_HEALTHCARE.format(
+                doc_title=ctx["doc_title"],
+                doc_summary=ctx["doc_summary"],
+                intended_use=ctx["intended_use"],
+                users_roles=ctx["users_roles"],
+                environment=ctx["environment"],
+                data_sources=ctx["data_sources"],
+                storage_retention=ctx["storage_retention"],
+                vendors=ctx["vendors"],
+                compliance=ctx["compliance"],
+                privacy_signals=ctx["privacy_signals"],
+                selection=selection,
             )
-            # Show a regulation preview
-            for reg in regulations[:2]:
-                description = reg.get("description", "")[:60]
-                status.detail(f"{reg.get('regulation', '')}: {description}...")
         else:
-            status.warning("No relevant regulations found")
+            system = SYSTEM_PRIVACY
+            user = USER_TMPL_PRIVACY.format(
+                doc_title=ctx["doc_title"],
+                doc_summary=ctx["doc_summary"],
+                intended_use=ctx["intended_use"],
+                users_roles=ctx["users_roles"],
+                environment=ctx["environment"],
+                data_sources=ctx["data_sources"],
+                storage_retention=ctx["storage_retention"],
+                vendors=ctx["vendors"],
+                compliance=ctx["compliance"],
+                privacy_signals=ctx["privacy_signals"],
+                selection=selection,
+            )
+    else:
+        system = SYSTEM_GENERAL
+        user = USER_TMPL_GENERAL.format(selection=selection)
 
-        hipaa_context = format_regulations_for_review_prompt(regulation_research)
-
-        system = SYSTEM_PRIVACY
-        user = USER_TMPL_PRIVACY.format(
-            doc_title=doc_title or "Untitled Document",
-            document_structure=document_structure_str,
-            hipaa_regulations=hipaa_context,
-            selection=selection,
-        )
-
-    # Generate review comments
-    status.step("Generating compliance review comments")
-
-    llm_start = time.time()
     resp = client.chat.completions.create(
         model=model,
         temperature=0.2,
-        max_tokens=4096,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
     )
-    llm_elapsed = (time.time() - llm_start) * 1000
 
     text = resp.choices[0].message.content or ""
     text = _strip_code_fences(text)
 
     data = json.loads(text)
 
-    # Extra guard: ensure privacy mode returns privacy-only types
+    # Extra guard (optional but useful): ensure privacy mode returns privacy-only types
     if mode == "privacy":
         for c in data.get("inline_comments", []):
             c["type"] = "privacy"
 
-    comments = data.get("inline_comments", [])
-    total_elapsed = (time.time() - start_time) * 1000
+    # Normalize LLM comment types to schema enum (LLMs sometimes invent near-synonyms)
+    TYPE_MAP = {
+        "transparency": "governance",
+        "explainability": "governance",
+        "interpretability": "governance",
+        "security": "risk",
+        "safety": "risk",
+        "fairness": "bias",
+        "discrimination": "bias",
+        "data_protection": "privacy",
+        "rights/risk": "regulatory",
+        "rights_risk": "regulatory",
+    }
 
-    # Filter out incomplete comments
-    original_count = len(comments)
-    comments = _filter_incomplete_comments(comments)
-    data["inline_comments"] = comments
+    allowed = {
+        "structure", "clarity", "logic", "missing_context", "risk", "question",
+        "rewrite", "compliance", "governance", "privacy", "bias",
+        "regulatory", "legal",
+    }
 
-    if len(comments) < original_count:
-        status.warning(f"Filtered out {original_count - len(comments)} incomplete comments")
-
-    # Emit comment summary
-    if comments:
-        high_count = sum(1 for c in comments if c.get("severity") == "high")
-        medium_count = sum(1 for c in comments if c.get("severity") == "medium")
-        low_count = sum(1 for c in comments if c.get("severity") == "low")
-
-        status.success(
-            f"Generated {len(comments)} review comments",
-            {
-                "total": len(comments),
-                "high": high_count,
-                "medium": medium_count,
-                "low": low_count,
-            }
-        )
-
-        # Show preview of first comment
-        if comments[0].get("comment"):
-            preview = comments[0]["comment"][:80] + "..." if len(comments[0]["comment"]) > 80 else comments[0]["comment"]
-            status.detail(f"First comment: {preview}")
-    else:
-        status.info("No privacy issues found in selection")
-
-    # Validate citations against provided regulations
-    if mode == "privacy" and provided_regulation_sections:
-        _validate_citations(comments, provided_regulation_sections)
-
-    status.complete(f"Review complete in {total_elapsed/1000:.1f}s")
-
-    # Add parsed structure to response
-    if parsed_components is not None:
-        data["parsed_components"] = parsed_components
-    if parsed_data_flows is not None:
-        data["parsed_data_flows"] = parsed_data_flows
+    for c in data.get("inline_comments", []):
+        t = (c.get("type") or "").strip().lower()
+        if t in TYPE_MAP:
+            c["type"] = TYPE_MAP[t]
+        elif t not in allowed:
+            c["type"] = "risk"
 
     return ReviewResponse.model_validate(data)
+

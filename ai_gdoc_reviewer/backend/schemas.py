@@ -1,25 +1,42 @@
 from pydantic import BaseModel, Field
-from typing import List, Literal, Optional, Dict, Any
+from typing import List, Literal, Optional
 
 Severity = Literal["low", "medium", "high"]
+CommentType = Literal[
+    "structure",
+    "clarity",
+    "logic",
+    "missing_context",
+    "risk",
+    "question",
+    "rewrite",
+    "compliance",
+    "governance",
+    "privacy",
+    "bias",
+    "regulatory",
+    "legal",
+]
 
 class InlineComment(BaseModel):
     target_quote: str = Field(..., description="Exact substring from input text.")
+    type: CommentType
     severity: Severity
     comment: str
-    related_components: List[str] = Field(
-        default_factory=list,
-        description="Names of components or data flows this comment applies to"
+    rewrite_suggestion: Optional[str] = None
+    # Healthcare regulatory lens fields (populated in healthcare mode)
+    trustworthiness_property: Optional[str] = Field(
+        None, description="Trustworthiness property name(s) from the taxonomy."
+    )
+    compliance_label: Optional[str] = Field(
+        None, description="Regulatory | Legal | Rights/Risk (can list multiple)."
+    )
+    regulatory_references: Optional[str] = Field(
+        None, description="Citations from the Regulatory Reference Index."
+    )
+    action_evidence: Optional[str] = Field(
+        None, description="What to add/change/test; what artifact proves it."
     )
 
 class ReviewResponse(BaseModel):
     inline_comments: List[InlineComment]
-    # Parsed document structure - returned from review phase to avoid re-parsing during apply
-    parsed_components: Optional[List[Dict[str, Any]]] = Field(
-        default=None,
-        description="Parsed technical components from the document (pass back during apply)"
-    )
-    parsed_data_flows: Optional[List[Dict[str, Any]]] = Field(
-        default=None,
-        description="Parsed data flows from the document (pass back during apply)"
-    )
